@@ -1,0 +1,31 @@
+#!/bin/sh /etc/rc.common
+
+# telegram-forwarder — procd service
+# Starts the Quart web UI + background scheduler for Telegram channel mirroring.
+
+USE_PROCD=1
+START=99
+
+APP_DIR="/root/tg-forwarder"
+PYTHON="/usr/bin/python3"
+PORT="5000"
+LOGFILE="/var/log/tg-forwarder.log"
+
+start_service() {
+    procd_open_instance
+    procd_set_param command "$PYTHON" "$APP_DIR/server.py"
+    procd_set_param env PORT="$PORT"
+    procd_set_param env DASH_USER="${DASH_USER:-admin}"
+    procd_set_param env DASH_PASS="${DASH_PASS:-}"
+    procd_set_param cwd "$APP_DIR"
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    # Restart on crash: up to 5 retries, 30s window, 10s cooldown.
+    procd_set_param respawn 3600 5 10
+    procd_set_param limits nofile=65535
+    procd_close_instance
+}
+
+reload_service() {
+    restart
+}

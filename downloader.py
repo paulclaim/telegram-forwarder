@@ -16,7 +16,7 @@ from typing import Optional, Callable
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetForumTopicsRequest, ForwardMessagesRequest
-from telethon.tl.types import ForumTopic, MessageMediaWebPage, DocumentAttributeFilename, UpdateNewChannelMessage, UpdateNewMessage
+from telethon.tl.types import ForumTopic, MessageMediaWebPage, DocumentAttributeFilename, DocumentAttributeVideo, UpdateNewChannelMessage, UpdateNewMessage
 from telethon.errors import FloodWaitError
 
 if hasattr(sys.stdout, "reconfigure") and sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -98,6 +98,10 @@ class TelegramDownloader:
         "text/plain": ".txt",
         "video/mp4": ".mp4",
         "video/x-matroska": ".mkv",
+        "video/quicktime": ".mov",
+        "video/webm": ".webm",
+        "video/x-msvideo": ".avi",
+        "video/mpeg": ".mpeg",
         "audio/mpeg": ".mp3",
         "audio/ogg": ".ogg",
     }
@@ -306,7 +310,7 @@ class TelegramDownloader:
         return not mime.startswith(("image/", "video/"))
 
     def _is_media(self, msg) -> bool:
-        return bool(msg.photo or msg.video or msg.gif or msg.sticker or msg.video_note)
+        return bool(msg.photo or msg.video or msg.gif or msg.video_note)
 
     # ─── Copy (download + re-upload, bypasses restrictions) ──────
 
@@ -325,14 +329,20 @@ class TelegramDownloader:
                 # Use msg.id-based temp name to avoid Windows-invalid chars in original filenames
                 original_name = None
                 ext = ""
+                video_attr = None
+                is_video_document = False
                 if msg.document:
+                    mime = msg.document.mime_type or ""
+                    is_video_document = mime.startswith("video/")
                     for attr in msg.document.attributes:
+                        if isinstance(attr, DocumentAttributeVideo):
+                            video_attr = attr
+                            is_video_document = True
                         if hasattr(attr, "file_name") and attr.file_name:
                             original_name = attr.file_name
                             ext = Path(attr.file_name).suffix
-                            break
                     if not ext:
-                        ext = self.MIME_TO_EXT.get(msg.document.mime_type or "", "")
+                        ext = self.MIME_TO_EXT.get(mime, "")
                 elif msg.photo:
                     ext = ".jpg"
                 safe_temp = temp_dir / f"tmp_{msg.id}{ext}"
@@ -356,9 +366,25 @@ class TelegramDownloader:
                 send_kwargs = {"caption": caption}
                 if msg.entities and not use_override:
                     send_kwargs["formatting_entities"] = msg.entities
+
+                # Build attributes while preserving the original filename AND any
+                # video metadata. If the file is a video (document with video MIME or
+                # DocumentAttributeVideo), do *not* force_document=True — otherwise
+                # Telegram renders it as a plain file download and the client shows
+                # no preview/player. For non-media documents keep force_document so
+                # the filename is honored.
+                attributes = []
                 if original_name:
-                    send_kwargs["force_document"] = True
-                    send_kwargs["attributes"] = [DocumentAttributeFilename(original_name)]
+                    attributes.append(DocumentAttributeFilename(original_name))
+                if video_attr:
+                    attributes.append(video_attr)
+                if attributes:
+                    send_kwargs["attributes"] = attributes
+                if is_video_document:
+                    send_kwargs["force_document"] = False
+                    send_kwargs["supports_streaming"] = getattr(video_attr, "supports_streaming", True) or True
+                else:
+                    send_kwargs["force_document"] = bool(original_name)
                 if reply_to:
                     send_kwargs["reply_to"] = reply_to
                 try:
