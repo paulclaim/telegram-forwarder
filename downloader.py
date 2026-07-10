@@ -16,7 +16,7 @@ from typing import Optional, Callable
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetForumTopicsRequest, ForwardMessagesRequest
-from telethon.tl.types import ForumTopic, MessageMediaWebPage, DocumentAttributeFilename, DocumentAttributeVideo, UpdateNewChannelMessage, UpdateNewMessage
+from telethon.tl.types import ForumTopic, MessageMediaWebPage, DocumentAttributeFilename, DocumentAttributeVideo, DocumentAttributeSticker, DocumentAttributeAnimated, UpdateNewChannelMessage, UpdateNewMessage
 from telethon.errors import FloodWaitError
 
 if hasattr(sys.stdout, "reconfigure") and sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -330,6 +330,8 @@ class TelegramDownloader:
                 original_name = None
                 ext = ""
                 video_attr = None
+                sticker_attr = None
+                animated_attr = None
                 is_video_document = False
                 if msg.document:
                     mime = msg.document.mime_type or ""
@@ -338,6 +340,10 @@ class TelegramDownloader:
                         if isinstance(attr, DocumentAttributeVideo):
                             video_attr = attr
                             is_video_document = True
+                        elif isinstance(attr, DocumentAttributeSticker):
+                            sticker_attr = attr
+                        elif isinstance(attr, DocumentAttributeAnimated):
+                            animated_attr = attr
                         if hasattr(attr, "file_name") and attr.file_name:
                             original_name = attr.file_name
                             ext = Path(attr.file_name).suffix
@@ -373,14 +379,27 @@ class TelegramDownloader:
                 # Telegram renders it as a plain file download and the client shows
                 # no preview/player. For non-media documents keep force_document so
                 # the filename is honored.
+                #
+                # Stickers: copy the original DocumentAttributeSticker (and
+                # DocumentAttributeAnimated for animated stickers) back onto the
+                # upload so the destination renders it as a sticker rather than a
+                # raw .webp/.webm/.tgs file. Stickers never carry a filename, so
+                # we also keep force_document=False.
+                is_sticker = sticker_attr is not None
                 attributes = []
-                if original_name:
+                if original_name and not is_sticker:
                     attributes.append(DocumentAttributeFilename(original_name))
-                if video_attr:
+                if video_attr and not is_sticker:
                     attributes.append(video_attr)
+                if is_sticker:
+                    if animated_attr:
+                        attributes.append(animated_attr)
+                    attributes.append(sticker_attr)
                 if attributes:
                     send_kwargs["attributes"] = attributes
-                if is_video_document:
+                if is_sticker:
+                    send_kwargs["force_document"] = False
+                elif is_video_document:
                     send_kwargs["force_document"] = False
                     send_kwargs["supports_streaming"] = getattr(video_attr, "supports_streaming", True) or True
                 else:
