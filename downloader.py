@@ -312,7 +312,215 @@ class TelegramDownloader:
     def _is_media(self, msg) -> bool:
         return bool(msg.photo or msg.video or msg.gif or msg.video_note)
 
+    async def is_source_protected(self, source_id) -> bool:
+        """Return True when the source forbids forwarding (must use copy-mode).
+
+        Fail-safe: any resolve error returns True so we never attempt a native
+        forward that would 400. Callers that already hold the entity can pass
+        it and skip the extra RPC via the noforwards attribute themselves.
+        """
+        try:
+            entity = await self.client.get_entity(source_id)
+            return bool(getattr(entity, "noforwards", False))
+        except Exception as e:
+            print(f"  couldn't resolve source {source_id} for noforwards check: {e} — assuming protected")
+            return True
+
+    @staticmethod
+    def _transfer_timeout(size_bytes: int) -> float:
+        """Adaptive download/upload timeout based on file size.
+
+        Assumes a conservative ~200 KiB/s floor plus 30s headroom, clamped to
+        [60s, 1800s]. Replaces the old fixed 300s cap that false-timed-out
+        large videos on slow links and over-waited on tiny stickers.
+        """
+        size = max(0, int(size_bytes or 0))
+        return float(min(1800, max(60, size / (200 * 1024) + 30)))
+
+    @staticmethod
+    def _unlink_quiet(path) -> None:
+        if not path:
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
     # ─── Copy (download + re-upload, bypasses restrictions) ──────
+
+    async def _download_copy_media(self, msg) -> Optional[dict]:
+        """Download media for copy-mode, or classify a text-only message.
+
+        Returns one of:
+          {"kind": "text"}
+          {"kind": "media", "temp_path": str, "size": int,
+           "original_name": ..., "video_attr": ..., "sticker_attr": ...,
+           "animated_attr": ..., "is_video_document": bool}
+          None — nothing to send, or download failed
+        Caller owns cleanup of temp_path (via _send_copy_payload or _unlink_quiet).
+        """
+        if not msg.media or isinstance(msg.media, MessageMediaWebPage):
+            if msg.message:
+                return {"kind": "text"}
+            return None
+
+        temp_dir = BASE_DIR / "temp"
+        temp_dir.mkdir(exist_ok=True)
+        # Use msg.id-based temp name to avoid Windows-invalid chars in original filenames
+        original_name = None
+        ext = ""
+        video_attr = None
+        sticker_attr = None
+        animated_attr = None
+        is_video_document = False
+        if msg.document:
+            mime = msg.document.mime_type or ""
+            is_video_document = mime.startswith("video/")
+            for attr in msg.document.attributes:
+                if isinstance(attr, DocumentAttributeVideo):
+                    video_attr = attr
+                    is_video_document = True
+                elif isinstance(attr, DocumentAttributeSticker):
+                    sticker_attr = attr
+                elif isinstance(attr, DocumentAttributeAnimated):
+                    animated_attr = attr
+                if hasattr(attr, "file_name") and attr.file_name:
+                    original_name = attr.file_name
+                    ext = Path(attr.file_name).suffix
+            if not ext:
+                ext = self.MIME_TO_EXT.get(mime, "")
+        elif msg.photo:
+            ext = ".jpg"
+        safe_temp = temp_dir / f"tmp_{msg.id}{ext}"
+        size = self._get_file_size(msg)
+        timeout = self._transfer_timeout(size)
+        temp_path = None
+        for attempt in range(3):
+            try:
+                temp_path = await asyncio.wait_for(
+                    self.client.download_media(msg, file=str(safe_temp)),
+                    timeout=timeout,
+                )
+                break
+            except asyncio.TimeoutError:
+                print(f"\n  ⏱ Skipping msg #{msg.id}: download timed out after {timeout:.0f}s")
+                self._unlink_quiet(safe_temp)
+                return None
+            except FloodWaitError as fw:
+                print(f"\n  ⏳ Download flood wait {fw.seconds}s (attempt {attempt + 1}/3)...")
+                await asyncio.sleep(fw.seconds + 1)
+            except Exception:
+                self._unlink_quiet(safe_temp)
+                raise
+        else:
+            self._unlink_quiet(safe_temp)
+            return None
+        if not temp_path:
+            self._unlink_quiet(safe_temp)
+            return None
+        return {
+            "kind": "media",
+            "temp_path": temp_path,
+            "size": size,
+            "original_name": original_name,
+            "video_attr": video_attr,
+            "sticker_attr": sticker_attr,
+            "animated_attr": animated_attr,
+            "is_video_document": is_video_document,
+        }
+
+    async def _send_copy_payload(self, msg, dest_id: int | str, payload: dict,
+                                 dest_topic: Optional[int] = None,
+                                 text_override: Optional[str] = None):
+        """Upload a payload from _download_copy_media. Always cleans media temps."""
+        reply_to = dest_topic if (dest_topic and dest_topic > 1) else None
+        use_override = text_override is not None
+
+        if payload.get("kind") == "text":
+            text = text_override if use_override else msg.message
+            if not text:
+                return None
+            return await self.client.send_message(
+                dest_id,
+                text,
+                formatting_entities=(msg.entities or None) if not use_override else None,
+                reply_to=reply_to,
+            )
+
+        if payload.get("kind") != "media":
+            return None
+
+        temp_path = payload.get("temp_path")
+        try:
+            caption = text_override if use_override else (msg.message or "")
+            send_kwargs = {"caption": caption}
+            if msg.entities and not use_override:
+                send_kwargs["formatting_entities"] = msg.entities
+
+            # Build attributes while preserving the original filename AND any
+            # video metadata. If the file is a video (document with video MIME or
+            # DocumentAttributeVideo), do *not* force_document=True — otherwise
+            # Telegram renders it as a plain file download and the client shows
+            # no preview/player. For non-media documents keep force_document so
+            # the filename is honored.
+            #
+            # Stickers: copy the original DocumentAttributeSticker (and
+            # DocumentAttributeAnimated for animated stickers) back onto the
+            # upload so the destination renders it as a sticker rather than a
+            # raw .webp/.webm/.tgs file. Stickers never carry a filename, so
+            # we also keep force_document=False.
+            original_name = payload.get("original_name")
+            video_attr = payload.get("video_attr")
+            sticker_attr = payload.get("sticker_attr")
+            animated_attr = payload.get("animated_attr")
+            is_video_document = bool(payload.get("is_video_document"))
+            is_sticker = sticker_attr is not None
+            attributes = []
+            if original_name and not is_sticker:
+                attributes.append(DocumentAttributeFilename(original_name))
+            if video_attr and not is_sticker:
+                attributes.append(video_attr)
+            if is_sticker:
+                if animated_attr:
+                    attributes.append(animated_attr)
+                attributes.append(sticker_attr)
+            if attributes:
+                send_kwargs["attributes"] = attributes
+            if is_sticker:
+                send_kwargs["force_document"] = False
+            elif is_video_document:
+                send_kwargs["force_document"] = False
+                send_kwargs["supports_streaming"] = getattr(video_attr, "supports_streaming", True) or True
+            else:
+                send_kwargs["force_document"] = bool(original_name)
+            if reply_to:
+                send_kwargs["reply_to"] = reply_to
+
+            size = payload.get("size") or 0
+            try:
+                size = max(size, os.path.getsize(temp_path))
+            except OSError:
+                pass
+            timeout = self._transfer_timeout(size)
+            for attempt in range(3):
+                try:
+                    return await asyncio.wait_for(
+                        self.client.send_file(dest_id, temp_path, **send_kwargs),
+                        timeout=timeout,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"\n  ⏱ Skipping msg #{msg.id}: upload timed out after {timeout:.0f}s")
+                    return None
+                except FloodWaitError as fw:
+                    print(f"\n  ⏳ Upload flood wait {fw.seconds}s (attempt {attempt + 1}/3)...")
+                    await asyncio.sleep(fw.seconds + 1)
+            print(f"\n  ✗ Upload msg #{msg.id}: gave up after 3 flood-waits")
+            return None
+        finally:
+            self._unlink_quiet(temp_path)
 
     async def _copy_message_to(self, msg, dest_id: int | str, dest_topic: Optional[int] = None,
                                text_override: Optional[str] = None):
@@ -320,123 +528,18 @@ class TelegramDownloader:
         # text_override: replaces msg.message verbatim (drops entities since
         # offsets would be wrong). Used by automate's per-pair replacements.
         # Returns the sent Message on success, None on failure.
-        reply_to = dest_topic if (dest_topic and dest_topic > 1) else None
-        use_override = text_override is not None
+        #
+        # Download and upload are split so automate's copy pipeline can
+        # download-ahead; this method composes them for sequential callers.
+        # FloodWait is handled inside _download_copy_media / _send_copy_payload.
         try:
-            if msg.media and not isinstance(msg.media, MessageMediaWebPage):
-                temp_dir = BASE_DIR / "temp"
-                temp_dir.mkdir(exist_ok=True)
-                # Use msg.id-based temp name to avoid Windows-invalid chars in original filenames
-                original_name = None
-                ext = ""
-                video_attr = None
-                sticker_attr = None
-                animated_attr = None
-                is_video_document = False
-                if msg.document:
-                    mime = msg.document.mime_type or ""
-                    is_video_document = mime.startswith("video/")
-                    for attr in msg.document.attributes:
-                        if isinstance(attr, DocumentAttributeVideo):
-                            video_attr = attr
-                            is_video_document = True
-                        elif isinstance(attr, DocumentAttributeSticker):
-                            sticker_attr = attr
-                        elif isinstance(attr, DocumentAttributeAnimated):
-                            animated_attr = attr
-                        if hasattr(attr, "file_name") and attr.file_name:
-                            original_name = attr.file_name
-                            ext = Path(attr.file_name).suffix
-                    if not ext:
-                        ext = self.MIME_TO_EXT.get(mime, "")
-                elif msg.photo:
-                    ext = ".jpg"
-                safe_temp = temp_dir / f"tmp_{msg.id}{ext}"
-                # Per-file timeouts so a stalled CDN doesn't deadlock the whole pair.
-                # Large videos can legitimately take 2-3 min; 300s is a safe ceiling.
-                try:
-                    temp_path = await asyncio.wait_for(
-                        self.client.download_media(msg, file=str(safe_temp)),
-                        timeout=300,
-                    )
-                except asyncio.TimeoutError:
-                    print(f"\n  ⏱ Skipping msg #{msg.id}: download timed out after 300s")
-                    try:
-                        safe_temp.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    return None
-                if not temp_path:
-                    return None
-                caption = text_override if use_override else (msg.message or "")
-                send_kwargs = {"caption": caption}
-                if msg.entities and not use_override:
-                    send_kwargs["formatting_entities"] = msg.entities
-
-                # Build attributes while preserving the original filename AND any
-                # video metadata. If the file is a video (document with video MIME or
-                # DocumentAttributeVideo), do *not* force_document=True — otherwise
-                # Telegram renders it as a plain file download and the client shows
-                # no preview/player. For non-media documents keep force_document so
-                # the filename is honored.
-                #
-                # Stickers: copy the original DocumentAttributeSticker (and
-                # DocumentAttributeAnimated for animated stickers) back onto the
-                # upload so the destination renders it as a sticker rather than a
-                # raw .webp/.webm/.tgs file. Stickers never carry a filename, so
-                # we also keep force_document=False.
-                is_sticker = sticker_attr is not None
-                attributes = []
-                if original_name and not is_sticker:
-                    attributes.append(DocumentAttributeFilename(original_name))
-                if video_attr and not is_sticker:
-                    attributes.append(video_attr)
-                if is_sticker:
-                    if animated_attr:
-                        attributes.append(animated_attr)
-                    attributes.append(sticker_attr)
-                if attributes:
-                    send_kwargs["attributes"] = attributes
-                if is_sticker:
-                    send_kwargs["force_document"] = False
-                elif is_video_document:
-                    send_kwargs["force_document"] = False
-                    send_kwargs["supports_streaming"] = getattr(video_attr, "supports_streaming", True) or True
-                else:
-                    send_kwargs["force_document"] = bool(original_name)
-                if reply_to:
-                    send_kwargs["reply_to"] = reply_to
-                try:
-                    sent = await asyncio.wait_for(
-                        self.client.send_file(dest_id, temp_path, **send_kwargs),
-                        timeout=300,
-                    )
-                except asyncio.TimeoutError:
-                    print(f"\n  ⏱ Skipping msg #{msg.id}: upload timed out after 300s")
-                    try:
-                        os.remove(temp_path)
-                    except OSError:
-                        pass
-                    return None
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
-                return sent
-            text = text_override if use_override else msg.message
-            if text:
-                sent = await self.client.send_message(
-                    dest_id,
-                    text,
-                    formatting_entities=(msg.entities or None) if not use_override else None,
-                    reply_to=reply_to,
-                )
-                return sent
-            return None
-        except FloodWaitError as fw:
-            print(f"\n  ⏳ Flood wait {fw.seconds}s...")
-            await asyncio.sleep(fw.seconds)
-            return await self._copy_message_to(msg, dest_id, dest_topic=dest_topic, text_override=text_override)
+            payload = await self._download_copy_media(msg)
+            if payload is None:
+                return None
+            return await self._send_copy_payload(
+                msg, dest_id, payload,
+                dest_topic=dest_topic, text_override=text_override,
+            )
         except Exception as e:
             print(f"\n  ✗ Failed msg #{msg.id}: {e}")
             return None
@@ -511,14 +614,16 @@ class TelegramDownloader:
         dest = await self.client.get_entity(dest_id)
         source_name = getattr(source, "title", str(source_id))
         dest_name = getattr(dest, "title", str(dest_id))
+        protected = bool(getattr(source, "noforwards", False))
 
         topics = await self.list_topics(source_id)
         topic_name = next((t["title"] for t in topics if t["id"] == topic_id), f"Topic #{topic_id}")
 
-        print(f"\n📨 Copying topic: {topic_name}")
+        mode = "copy" if protected else "native"
+        print(f"\n📨 Forwarding topic: {topic_name}")
         print(f"   From: {source_name} → {dest_name}")
         print(f"   Type: {forward_type} | Limit: {limit or 'unlimited'}")
-        print(f"   Mode: Copy (bypasses forwarding restrictions)")
+        print(f"   Mode: {mode}" + (" (source is protected)" if protected else " (server-side batch)"))
 
         stats = {
             "source": source_name,
@@ -556,29 +661,55 @@ class TelegramDownloader:
         total = len(messages_to_send)
         print(f"   Sending {total} messages...\n")
 
-        (BASE_DIR / "temp").mkdir(exist_ok=True)
+        if protected:
+            (BASE_DIR / "temp").mkdir(exist_ok=True)
+            for i, msg in enumerate(messages_to_send, 1):
+                success = await self._copy_message_to(msg, dest_id)
+                if success:
+                    stats["forwarded"] += 1
+                else:
+                    stats["failed"] += 1
 
-        for i, msg in enumerate(messages_to_send, 1):
-            success = await self._copy_message_to(msg, dest_id)
-            if success:
-                stats["forwarded"] += 1
-            else:
-                stats["failed"] += 1
+                print(f"  {'✓' if success else '✗'} {i}/{total} (msg #{msg.id})", end="\r", flush=True)
+                if on_progress:
+                    on_progress(i, total)
+                await asyncio.sleep(delay)
 
-            print(f"  {'✓' if success else '✗'} {i}/{total} (msg #{msg.id})", end="\r", flush=True)
-            if on_progress:
-                on_progress(i, total)
-            await asyncio.sleep(delay)
-
-        try:
-            import shutil
-            shutil.rmtree(BASE_DIR / "temp", ignore_errors=True)
-        except Exception:
-            pass
+            try:
+                import shutil
+                shutil.rmtree(BASE_DIR / "temp", ignore_errors=True)
+            except Exception:
+                pass
+        else:
+            # Native batch. Prefer ForwardMessagesRequest so we can target a
+            # forum-topic destination via top_msg_id when dest is a forum.
+            batch_size = 100
+            for i in range(0, total, batch_size):
+                batch = messages_to_send[i:i + batch_size]
+                try:
+                    await self.forward_batch(source_id, dest_id, batch, drop_author=True)
+                    stats["forwarded"] += len(batch)
+                    print(f"  ✓ Forwarded {stats['forwarded']}/{total}", end="\r", flush=True)
+                    if on_progress:
+                        on_progress(stats["forwarded"], total)
+                    if i + batch_size < total:
+                        await asyncio.sleep(delay)
+                except FloodWaitError as fw:
+                    print(f"\n  ⏳ Flood wait {fw.seconds}s...")
+                    await asyncio.sleep(fw.seconds)
+                    try:
+                        await self.forward_batch(source_id, dest_id, batch, drop_author=True)
+                        stats["forwarded"] += len(batch)
+                    except Exception as e2:
+                        stats["failed"] += len(batch)
+                        print(f"  ✗ Retry failed: {e2}")
+                except Exception as e:
+                    stats["failed"] += len(batch)
+                    print(f"\n  ✗ Batch failed: {e}")
 
         print(f"\n\n{'='*50}")
         print(f"  ✓ Complete: {topic_name} → {dest_name}")
-        print(f"  Scanned: {stats['total_scanned']} | Copied: {stats['forwarded']} | Failed: {stats['failed']}")
+        print(f"  Scanned: {stats['total_scanned']} | Forwarded: {stats['forwarded']} | Failed: {stats['failed']}")
         print(f"{'='*50}\n")
         return stats
 
@@ -597,6 +728,7 @@ class TelegramDownloader:
         dest = await self.client.get_entity(dest_id)
         source_name = getattr(source, "title", str(source_id))
         dest_name = getattr(dest, "title", str(dest_id))
+        # Prefer entity we already resolved; fall back to helper for consistency.
         protected = bool(getattr(source, "noforwards", False))
 
         print(f"\n📨 Forwarding: {source_name} → {dest_name}")

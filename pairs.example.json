@@ -16,6 +16,16 @@
       "type": "documents",
       "delay_seconds": 1.5,
       "max_per_run": 50
+    },
+    {
+      "name": "example-protected-copy",
+      "source": -1003333333333,
+      "dest": -1004444444444,
+      "type": "media",
+      "delay_seconds": 0.5,
+      "max_per_run": 100,
+      "max_file_size_mb": 500,
+      "copy_concurrency": 3
     }
   ]
 }

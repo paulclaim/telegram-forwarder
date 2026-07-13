@@ -24,7 +24,7 @@ from typing import Optional
 from quart import Quart, request, jsonify, render_template, Response
 
 from telethon import events, utils as tg_utils
-from telethon.errors import MessageNotModifiedError
+from telethon.errors import FloodWaitError, MessageNotModifiedError
 from telethon.tl.functions.channels import CreateChannelRequest, ToggleForumRequest
 from telethon.tl.functions.messages import CreateForumTopicRequest
 
@@ -735,6 +735,12 @@ async def api_forward_once():
     job = _new_job(kind="oneshot", label=f"oneshot {source}->{dest}", total=limit)
     _log_event({"kind": "oneshot_started", "source": source, "dest": dest, "type": ftype, "limit": limit, "job_id": job["id"]})
 
+    # Prefer native server-side forward when the source allows it — oneshot
+    # used to always download+reupload even for unprotected channels.
+    protected = await _dl.is_source_protected(source)
+    mode = "copy" if protected else "native"
+    print(f"[oneshot {source}->{dest}] mode={mode}")
+
     iter_kwargs = {"limit": limit or None}
     if source_topic and source_topic > 1:
         iter_kwargs["reply_to"] = source_topic
@@ -746,28 +752,63 @@ async def api_forward_once():
             job["status"] = "cancelled"
             job["finished_at"] = int(time.time())
             return jsonify({"ok": True, "result": {
-                "forwarded": 0, "failed": 0, "scanned": len(msgs), "cancelled": True,
+                "forwarded": 0, "failed": 0, "scanned": len(msgs), "cancelled": True, "mode": mode,
             }, "job_id": job["id"]})
         if _matches_type(m, ftype, _dl):
             msgs.append(m)
     msgs.sort(key=lambda m: m.id)
-    (BASE_DIR / "temp").mkdir(exist_ok=True)
 
     job["total"] = len(msgs)
     job["status"] = "running"
     ok = fail = 0
     try:
-        for i, m in enumerate(msgs, 1):
-            if job.get("cancel"):
-                job["status"] = "cancelled"
-                break
-            success = await _dl._copy_message_to(m, dest, dest_topic=dest_topic)
-            if success:
-                ok += 1
-            else:
-                fail += 1
-            job.update({"done": i, "ok": ok, "fail": fail, "last_id": m.id})
-            await asyncio.sleep(delay)
+        if not protected:
+            # Native batch path — no local media I/O.
+            BATCH = 100
+            i = 0
+            for start in range(0, len(msgs), BATCH):
+                if job.get("cancel"):
+                    job["status"] = "cancelled"
+                    break
+                batch = msgs[start:start + BATCH]
+                try:
+                    if dest_topic and dest_topic > 1:
+                        await _dl.forward_batch(source, dest, batch, drop_author=True, top_msg_id=dest_topic)
+                    else:
+                        await _dl.client.forward_messages(dest, batch, source, drop_author=True)
+                    ok += len(batch)
+                except FloodWaitError as fw:
+                    print(f"[oneshot {source}->{dest}] flood wait {fw.seconds}s")
+                    await asyncio.sleep(fw.seconds + 1)
+                    try:
+                        if dest_topic and dest_topic > 1:
+                            await _dl.forward_batch(source, dest, batch, drop_author=True, top_msg_id=dest_topic)
+                        else:
+                            await _dl.client.forward_messages(dest, batch, source, drop_author=True)
+                        ok += len(batch)
+                    except Exception as e:
+                        print(f"[oneshot {source}->{dest}] batch retry failed: {e}")
+                        fail += len(batch)
+                except Exception as e:
+                    print(f"[oneshot {source}->{dest}] batch failed: {e}")
+                    fail += len(batch)
+                i += len(batch)
+                job.update({"done": i, "ok": ok, "fail": fail, "last_id": batch[-1].id})
+                if start + BATCH < len(msgs):
+                    await asyncio.sleep(delay)
+        else:
+            (BASE_DIR / "temp").mkdir(exist_ok=True)
+            for i, m in enumerate(msgs, 1):
+                if job.get("cancel"):
+                    job["status"] = "cancelled"
+                    break
+                success = await _dl._copy_message_to(m, dest, dest_topic=dest_topic)
+                if success:
+                    ok += 1
+                else:
+                    fail += 1
+                job.update({"done": i, "ok": ok, "fail": fail, "last_id": m.id})
+                await asyncio.sleep(delay)
         if job["status"] != "cancelled":
             job["status"] = "finished"
     finally:
@@ -778,7 +819,10 @@ async def api_forward_once():
         except Exception:
             pass
 
-    result = {"forwarded": ok, "failed": fail, "scanned": len(msgs), "cancelled": job["status"] == "cancelled"}
+    result = {
+        "forwarded": ok, "failed": fail, "scanned": len(msgs),
+        "cancelled": job["status"] == "cancelled", "mode": mode,
+    }
     _log_event({"kind": "oneshot_finished", "source": source, "dest": dest, "result": result, "job_id": job["id"]})
     return jsonify({"ok": True, "result": result, "job_id": job["id"]})
 

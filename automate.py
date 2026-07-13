@@ -266,9 +266,9 @@ def _pair_key(pair: dict) -> str:
 def _msg_media_size_bytes(msg) -> int:
     """Largest media-attachment size in bytes, or 0 if no media.
     Used by the per-pair `max_file_size_mb` filter to skip huge files in
-    copy-mode WITHOUT attempting download (which would burn ~5 min via the
-    300s `wait_for` cap before timing out). Native forwards don't care
-    because Telegram relays the bytes server-side."""
+    copy-mode WITHOUT attempting download (adaptive timeouts still apply for
+    allowed files). Native forwards don't care because Telegram relays the
+    bytes server-side."""
     if getattr(msg, "document", None):
         return getattr(msg.document, "size", 0) or 0
     if getattr(msg, "video", None):
@@ -281,6 +281,22 @@ def _msg_media_size_bytes(msg) -> int:
         sizes = getattr(msg.photo, "sizes", []) or []
         return max((getattr(s, "size", 0) or 0) for s in sizes) if sizes else 0
     return 0
+
+
+# Files larger than this share a single download slot so multi-GB videos can't
+# pile up on disk during the download-ahead pipeline (important on OpenWrt).
+_COPY_LARGE_FILE_BYTES = 20 * 1024 * 1024
+
+
+def _copy_concurrency(pair: dict, dl: TelegramDownloader) -> int:
+    """Clamp copy-mode download-ahead concurrency to 1–3."""
+    raw = pair.get("copy_concurrency")
+    if raw is None:
+        raw = getattr(dl, "max_concurrent", 3)
+    try:
+        return max(1, min(3, int(raw)))
+    except (TypeError, ValueError):
+        return 1
 
 
 def _matches_type(msg, ftype: str, dl: TelegramDownloader) -> bool:
@@ -370,14 +386,8 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
     #     of a download+upload — still 100x faster than copy-mode.
     # Only blocker: source has forwarding disabled (noforwards=True) → must
     # fall back to copy-mode because the bytes can't leave the channel.
-    use_native = False
-    try:
-        src_entity = await dl.client.get_entity(source)
-        src_protected = bool(getattr(src_entity, "noforwards", False))
-        if not src_protected:
-            use_native = True
-    except Exception as e:
-        print(f"[{name}] couldn't resolve source for noforwards check: {e} — using copy-mode")
+    src_protected = await dl.is_source_protected(source)
+    use_native = not src_protected
 
     mode = "native" if use_native else "copy"
     topic_note = ""
@@ -417,61 +427,95 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
         iter_kwargs.pop("limit", None)  # streaming: paginate via Telethon, cap by max_per_run below
         batch = []
         i = 0
-        progress_printed_at = 0
-        async def _flush_batch():
-            nonlocal ok, fail, last_ok_id, i, batch, progress_printed_at
-            if not batch:
+
+        async def _do_forward(msgs_batch):
+            if dest_topic and dest_topic > 1:
+                return await dl.forward_batch(
+                    source, dest, msgs_batch, drop_author=drop_author, top_msg_id=dest_topic
+                )
+            return await dl.client.forward_messages(
+                dest, msgs_batch, source, drop_author=drop_author
+            )
+
+        async def _apply_edits(edits):
+            # Caption rewrites after durable mapping. Bounded concurrency so a
+            # batch of 100 replacements doesn't serialize 25s of 0.25s sleeps.
+            if not edits:
+                return
+            sem = asyncio.Semaphore(5)
+
+            async def _one(src_id, dest_id, new_text):
+                async with sem:
+                    try:
+                        await dl.client.edit_message(dest, dest_id, new_text, parse_mode=None)
+                    except FloodWaitError as fw:
+                        print(f"[{name}] edit-after flood wait {fw.seconds}s at src#{src_id}")
+                        await asyncio.sleep(fw.seconds + 1)
+                        try:
+                            await dl.client.edit_message(dest, dest_id, new_text, parse_mode=None)
+                        except Exception as e:
+                            print(f"[{name}] edit src#{src_id}->dst#{dest_id} retry failed: {e}")
+                    except MessageNotModifiedError:
+                        pass
+                    except Exception as e:
+                        print(f"[{name}] edit src#{src_id}->dst#{dest_id} failed: {type(e).__name__}: {e}")
+                    await asyncio.sleep(0.1)
+
+            await asyncio.gather(*[_one(s, d, t) for s, d, t in edits])
+
+        async def _forward_slice(msgs_batch) -> bool:
+            """Forward one slice; binary-split on failure so one bad id doesn't
+            drop up to 99 good ones. Returns True if any msg was accepted."""
+            nonlocal ok, fail, last_ok_id, i
+            if not msgs_batch:
                 return False
-            # Route through dl.forward_batch when dest is a forum topic so
-            # top_msg_id is set on the raw ForwardMessagesRequest. Otherwise
-            # use the high-level wrapper (faster init, same result).
-            async def _do_forward():
-                if dest_topic and dest_topic > 1:
-                    return await dl.forward_batch(source, dest, batch, drop_author=drop_author, top_msg_id=dest_topic)
-                return await dl.client.forward_messages(dest, batch, source, drop_author=drop_author)
-            try:
-                forwarded = await _do_forward()
-            except FloodWaitError as fw:
-                print(f"[{name}] flood wait {fw.seconds}s")
-                await asyncio.sleep(fw.seconds)
+
+            async def _attempt():
                 try:
-                    forwarded = await _do_forward()
+                    return await _do_forward(msgs_batch), None
+                except FloodWaitError as fw:
+                    print(f"[{name}] flood wait {fw.seconds}s")
+                    await asyncio.sleep(fw.seconds + 1)
+                    try:
+                        return await _do_forward(msgs_batch), None
+                    except Exception as e:
+                        return None, e
                 except Exception as e:
-                    print(f"[{name}] batch failed after flood-wait retry: {e} — skipping {len(batch)} msgs (last id #{batch[-1].id})")
-                    fail += len(batch)
-                    i += len(batch)
-                    batch.clear()
+                    return None, e
+
+            forwarded, err = await _attempt()
+            if err is not None:
+                if len(msgs_batch) == 1:
+                    m = msgs_batch[0]
+                    print(f"[{name}] msg #{m.id} failed: {err} — skipping")
+                    fail += 1
+                    # Advance past the single bad message so we don't loop forever.
+                    last_ok_id = max(last_ok_id, m.id)
+                    now = int(time.time())
+                    state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
+                    await save_pair_watermark(name, last_ok_id, now)
+                    i += 1
                     return False
-            except Exception as e:
-                # One bad message (e.g. expired/unsupported media) would 500
-                # the whole batch. Mark batch as failed and advance so the
-                # run doesn't get stuck retrying the same broken span forever.
-                print(f"[{name}] batch failed: {e} — skipping {len(batch)} msgs (last id #{batch[-1].id})")
-                fail += len(batch)
-                # Advance watermark past the bad batch so we don't loop on it.
-                last_ok_id = max(last_ok_id, batch[-1].id)
-                now = int(time.time())
-                state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
-                await save_pair_watermark(name, last_ok_id, now)
-                i += len(batch)
-                batch.clear()
-                return False
+                mid = len(msgs_batch) // 2
+                print(
+                    f"[{name}] batch of {len(msgs_batch)} failed: {err} — "
+                    f"splitting into {mid}+{len(msgs_batch) - mid}"
+                )
+                left = await _forward_slice(msgs_batch[:mid])
+                right = await _forward_slice(msgs_batch[mid:])
+                return left or right
+
             # Single-message forward_messages returns a Message (not a list)
             # in some Telethon versions. Normalize so we can always zip.
             forwarded_list = forwarded if isinstance(forwarded, (list, tuple)) else [forwarded]
             mappings = []
-            edits = []  # (src_id, dest_id, new_text) — applied after record_mappings
-            for m, f in zip(batch, forwarded_list):
+            edits = []
+            for m, f in zip(msgs_batch, forwarded_list):
                 if f is not None:
                     ok += 1
                     last_ok_id = m.id
-                    # f.id is the destination message id — record for live
-                    # edit/delete propagation in server.py event handlers.
                     dest_id = getattr(f, "id", None)
                     mappings.append((m.id, dest_id))
-                    # Post-forward caption rewrite: native forward re-sent the
-                    # original bytes verbatim, so any replacements in pair config
-                    # have to be applied as a follow-up edit on the dest msg.
                     if replacements and m.message and dest_id is not None:
                         new_text = apply_replacements(m.message, replacements)
                         if new_text != m.message:
@@ -480,37 +524,23 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                     fail += 1
             if mappings:
                 await record_mappings(name, mappings)
-            # Apply caption rewrites after the mapping is durable — if an edit
-            # crashes we still know the forward happened. parse_mode=None sends
-            # the cleaned text as plain (no markdown), so leftover `*`/`_`/`[`
-            # from regex strips don't trip Telethon's entity parser with
-            # "Failed to parse message".
-            for src_id, dest_id, new_text in edits:
-                try:
-                    await dl.client.edit_message(dest, dest_id, new_text, parse_mode=None)
-                except FloodWaitError as fw:
-                    print(f"[{name}] edit-after flood wait {fw.seconds}s at src#{src_id}")
-                    await asyncio.sleep(fw.seconds + 1)
-                    try:
-                        await dl.client.edit_message(dest, dest_id, new_text, parse_mode=None)
-                    except Exception as e:
-                        print(f"[{name}] edit src#{src_id}->dst#{dest_id} retry failed: {e}")
-                except MessageNotModifiedError:
-                    pass
-                except Exception as e:
-                    print(f"[{name}] edit src#{src_id}->dst#{dest_id} failed: {type(e).__name__}: {e}")
-                await asyncio.sleep(0.25)
-            i += len(batch)
+            await _apply_edits(edits)
+            i += len(msgs_batch)
             now = int(time.time())
             state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
             await save_pair_watermark(name, last_ok_id, now)
             if job:
                 job.update({"done": i, "ok": ok, "fail": fail, "last_id": last_ok_id, "status": "running"})
-            # Print every batch (more visible than every 10) — native is fast enough.
             print(f"[{name}] progress {i} (ok={ok} fail={fail} last_id=#{last_ok_id})")
-            progress_printed_at = i
-            batch.clear()
             return True
+
+        async def _flush_batch():
+            nonlocal batch
+            if not batch:
+                return False
+            current = list(batch)
+            batch.clear()
+            return await _forward_slice(current)
 
         async for m in dl.client.iter_messages(source, reverse=True, **iter_kwargs):
             if job and job.get("cancel"):
@@ -533,104 +563,213 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
         print(f"[{name}] done: forwarded={ok} failed={fail} new_watermark=#{last_ok_id}")
         return {"forwarded": ok, "failed": fail, "last_id": last_ok_id}
 
-    # ── Copy-mode (protected source) — per-message download + upload.
-    # Still builds the full list first; copy mode is slow per-message anyway so
-    # the scan overhead is negligible relative to one big file's upload time.
-    # `max_file_size_mb` per-pair filter skips huge files BEFORE attempting
-    # download — without it, a 1GB video burns ~5 min via the 300s wait_for cap
-    # in `dl._copy_message_to` before timing out. 0 / missing = unlimited.
+    # ── Copy-mode (protected source) — stream + download-ahead + ordered upload.
+    # Streaming keeps memory flat (mirrors native). Download-ahead overlaps CDN
+    # fetch with the previous upload; uploads stay sequential so dest order and
+    # per-message watermark semantics match the old serial path.
+    # `max_file_size_mb` skips huge files BEFORE download. 0 / missing = unlimited.
     max_size_bytes = int(pair.get("max_file_size_mb", 0) or 0) * 1024 * 1024
-    msgs = []
-    skipped_oversize = 0
-    async for m in dl.client.iter_messages(source, **iter_kwargs):
-        if job and job.get("cancel"):
-            print(f"[{name}] cancelled during scan ({len(msgs)} matched so far)")
-            job["status"] = "cancelled"
-            job["finished_at"] = int(time.time())
-            return {"forwarded": 0, "failed": 0, "last_id": watermark, "cancelled": True}
-        if not _matches_type(m, ftype, dl):
-            continue
-        if max_size_bytes > 0:
-            sz = _msg_media_size_bytes(m)
-            if sz > max_size_bytes:
-                skipped_oversize += 1
-                print(f"[{name}] skip #{m.id}: media {sz // (1024*1024)} MB > cap {pair.get('max_file_size_mb')} MB")
-                continue
-        msgs.append(m)
-    if skipped_oversize:
-        print(f"[{name}] filter: skipped {skipped_oversize} oversize msg(s) — they'll be re-evaluated next run if cap is raised")
-
-    msgs.sort(key=lambda m: m.id)
-    if max_per_run:
-        msgs = msgs[:max_per_run]
-
-    if not msgs:
-        print(f"[{name}] no new messages")
-        if job:
-            job.update({"total": 0, "status": "finished"})
-        return {"forwarded": 0, "failed": 0, "last_id": watermark}
-
-    print(f"[{name}] copying {len(msgs)} new (#{msgs[0].id} -> #{msgs[-1].id})")
+    concurrency = _copy_concurrency(pair, dl)
+    iter_kwargs.pop("limit", None)  # stream; cap via max_per_run below
     (BASE_DIR / "temp").mkdir(exist_ok=True)
 
     if job:
-        job.update({"total": len(msgs), "status": "running"})
-    for i, m in enumerate(msgs, 1):
-        if job and job.get("cancel"):
-            print(f"[{name}] cancelled at {i}/{len(msgs)}")
-            job["status"] = "cancelled"
-            break
-        # Per-message "starting" line so a stall surfaces immediately. We print
-        # which message we're about to process; if the engine hangs, the last
-        # printed line points at the culprit. flush=True bypasses stdout buffering.
-        media_kind = ""
+        job.update({"status": "running"})
+
+    print(f"[{name}] copy pipeline concurrency={concurrency}")
+
+    download_sem = asyncio.Semaphore(concurrency)
+    large_sem = asyncio.Semaphore(1)  # at most one >20MB download at a time
+    # Ordered handoff: producer fills slots by arrival order; uploader drains 0..n
+    ready: dict[int, dict] = {}
+    ready_event = asyncio.Event()
+    producer_done = False
+    cancelled = False
+    next_upload_idx = 0
+    next_slot = 0
+    skipped_oversize = 0
+    inflight: set[asyncio.Task] = set()
+
+    def _media_kind(m) -> str:
         if getattr(m, "photo", None):
-            media_kind = " photo"
-        elif getattr(m, "document", None):
+            return " photo"
+        if getattr(m, "document", None):
             dsize = getattr(m.document, "size", 0) or 0
-            media_kind = f" doc/{dsize // 1024}KB" if dsize else " doc"
-        elif getattr(m, "video", None):
-            media_kind = " video"
-        elif getattr(m, "media", None):
-            media_kind = " media"
-        print(f"[{name}] → {i}/{len(msgs)} src#{m.id}{media_kind}", flush=True)
-        # Apply per-pair text replacements before send. Pass None when no
-        # rules so _copy_message_to preserves the original entities.
+            return f" doc/{dsize // 1024}KB" if dsize else " doc"
+        if getattr(m, "video", None):
+            return " video"
+        if getattr(m, "media", None):
+            return " media"
+        return ""
+
+    async def _download_slot(slot: int, m) -> None:
         override = None
         if replacements and m.message:
             transformed = apply_replacements(m.message, replacements)
             if transformed != m.message:
                 override = transformed
-        sent = await dl._copy_message_to(m, dest, dest_topic=dest_topic, text_override=override)
-        if sent:
-            ok += 1
-            last_ok_id = m.id
-            # Persist watermark per-message so a crash doesn't re-send anything.
-            # Atomic per-pair RMW — see save_pair_watermark docstring.
-            now = int(time.time())
-            state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
-            await save_pair_watermark(name, last_ok_id, now)
-            dest_msg_id = getattr(sent, "id", None)
-            if dest_msg_id is not None:
-                await record_mappings(name, [(m.id, dest_msg_id)])
-        else:
-            fail += 1
-        if job:
-            job.update({"done": i, "ok": ok, "fail": fail, "last_id": last_ok_id})
-        if i % 25 == 0 or i == len(msgs):
-            print(f"[{name}] progress {i}/{len(msgs)} (ok={ok} fail={fail})", flush=True)
-        await asyncio.sleep(delay)
-    if job and job["status"] == "running":
-        job["status"] = "finished"
+        size = _msg_media_size_bytes(m)
+        use_large = size > _COPY_LARGE_FILE_BYTES
+        try:
+            async with download_sem:
+                if use_large:
+                    async with large_sem:
+                        payload = await dl._download_copy_media(m)
+                else:
+                    payload = await dl._download_copy_media(m)
+            ready[slot] = {
+                "msg": m, "payload": payload, "override": override, "error": None,
+            }
+        except Exception as e:
+            ready[slot] = {
+                "msg": m, "payload": None, "override": override, "error": e,
+            }
+        ready_event.set()
+
+    async def _producer():
+        nonlocal next_slot, skipped_oversize, producer_done, cancelled
+        try:
+            async for m in dl.client.iter_messages(source, reverse=True, **iter_kwargs):
+                if job and job.get("cancel"):
+                    cancelled = True
+                    print(f"[{name}] cancelled during stream at slot={next_slot}")
+                    break
+                if not _matches_type(m, ftype, dl):
+                    continue
+                if max_size_bytes > 0:
+                    sz = _msg_media_size_bytes(m)
+                    if sz > max_size_bytes:
+                        skipped_oversize += 1
+                        print(
+                            f"[{name}] skip #{m.id}: media {sz // (1024*1024)} MB "
+                            f"> cap {pair.get('max_file_size_mb')} MB"
+                        )
+                        continue
+                if max_per_run and next_slot >= max_per_run:
+                    break
+                slot = next_slot
+                next_slot += 1
+                print(f"[{name}] → dl {slot + 1} src#{m.id}{_media_kind(m)}", flush=True)
+                task = asyncio.create_task(_download_slot(slot, m))
+                inflight.add(task)
+                task.add_done_callback(inflight.discard)
+                # Bound in-flight downloads roughly to concurrency so we don't
+                # queue thousands of tasks on a huge backlog.
+                while len(inflight) >= concurrency * 2:
+                    await asyncio.sleep(0.05)
+                    if job and job.get("cancel"):
+                        cancelled = True
+                        break
+                if cancelled:
+                    break
+        finally:
+            if inflight:
+                await asyncio.gather(*list(inflight), return_exceptions=True)
+            producer_done = True
+            ready_event.set()
+            if skipped_oversize:
+                print(
+                    f"[{name}] filter: skipped {skipped_oversize} oversize msg(s) — "
+                    f"they'll be re-evaluated next run if cap is raised"
+                )
+
+    async def _uploader():
+        nonlocal ok, fail, last_ok_id, next_upload_idx, cancelled
+        processed = 0
+        while True:
+            if job and job.get("cancel"):
+                cancelled = True
+            while next_upload_idx not in ready:
+                if producer_done and next_upload_idx >= next_slot:
+                    return
+                if cancelled and next_upload_idx not in ready:
+                    # Drain any already-finished slots so temps get cleaned; stop
+                    # waiting forever for slots the producer abandoned.
+                    if producer_done:
+                        return
+                ready_event.clear()
+                if next_upload_idx in ready:
+                    break
+                if producer_done and next_upload_idx >= next_slot:
+                    return
+                try:
+                    await asyncio.wait_for(ready_event.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+
+            item = ready.pop(next_upload_idx)
+            m = item["msg"]
+            payload = item["payload"]
+            override = item["override"]
+            err = item["error"]
+            processed += 1
+
+            if err is not None:
+                print(f"[{name}] ✗ dl src#{m.id}: {err}", flush=True)
+                fail += 1
+            elif payload is None:
+                fail += 1
+            else:
+                try:
+                    sent = await dl._send_copy_payload(
+                        m, dest, payload,
+                        dest_topic=dest_topic, text_override=override,
+                    )
+                except Exception as e:
+                    print(f"[{name}] ✗ ul src#{m.id}: {e}", flush=True)
+                    if isinstance(payload, dict) and payload.get("kind") == "media":
+                        dl._unlink_quiet(payload.get("temp_path"))
+                    sent = None
+                if sent:
+                    ok += 1
+                    last_ok_id = m.id
+                    now = int(time.time())
+                    state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
+                    await save_pair_watermark(name, last_ok_id, now)
+                    dest_msg_id = getattr(sent, "id", None)
+                    if dest_msg_id is not None:
+                        await record_mappings(name, [(m.id, dest_msg_id)])
+                else:
+                    fail += 1
+
+            if job:
+                job.update({
+                    "done": processed, "ok": ok, "fail": fail,
+                    "last_id": last_ok_id, "total": max(next_slot, processed),
+                })
+            if processed % 25 == 0:
+                print(f"[{name}] progress {processed} (ok={ok} fail={fail})", flush=True)
+            next_upload_idx += 1
+            await asyncio.sleep(delay)
 
     try:
-        import shutil
-        shutil.rmtree(BASE_DIR / "temp", ignore_errors=True)
-    except Exception:
-        pass
+        await asyncio.gather(_producer(), _uploader())
+    finally:
+        # Drop any leftover payloads (cancel / crash mid-pipeline).
+        for item in ready.values():
+            payload = item.get("payload")
+            if isinstance(payload, dict) and payload.get("kind") == "media":
+                dl._unlink_quiet(payload.get("temp_path"))
+        ready.clear()
+        try:
+            import shutil
+            shutil.rmtree(BASE_DIR / "temp", ignore_errors=True)
+        except Exception:
+            pass
 
+    if job:
+        if cancelled or (job.get("cancel") and job.get("status") != "finished"):
+            job["status"] = "cancelled"
+        elif job.get("status") == "running":
+            job["status"] = "finished"
+
+    if next_slot == 0:
+        print(f"[{name}] no new messages")
     print(f"[{name}] done: forwarded={ok} failed={fail} new_watermark=#{last_ok_id}")
-    return {"forwarded": ok, "failed": fail, "last_id": last_ok_id}
+    return {
+        "forwarded": ok, "failed": fail, "last_id": last_ok_id,
+        **({"cancelled": True} if cancelled else {}),
+    }
 
 
 async def run_once(dl: Optional[TelegramDownloader] = None) -> dict:

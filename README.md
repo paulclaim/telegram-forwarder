@@ -43,14 +43,14 @@ See [CREDITS.md](CREDITS.md) for the inspiration we drew from tgcf (text replace
 ## Features
 
 **Forwarding modes**
-- Native server-side `forward_messages` at 100/call with optional `drop_author=True` — fast and bandwidth-free. Also used when the destination is a forum topic (via raw `ForwardMessagesRequest` with `top_msg_id`).
-- Copy mode (download to temp + re-upload) — automatic fallback only when the source is protected (`noforwards=True`).
+- Native server-side `forward_messages` at 100/call with optional `drop_author=True` — fast and bandwidth-free. Also used when the destination is a forum topic (via raw `ForwardMessagesRequest` with `top_msg_id`). One-shot and topic forwards use the same mode selection (native when allowed).
+- Copy mode (download to temp + re-upload) — automatic fallback only when the source is protected (`noforwards=True`). Streams messages, download-ahead with up to 3 concurrent downloads, sequential upload for order + watermark safety. Adaptive transfer timeouts scale with file size.
 - Preserves text formatting, inline hyperlinks, and the original filename on documents.
 
 **Backfill at scale**
-- Streaming iteration over `iter_messages(reverse=True, min_id=watermark)` — memory stays flat on arbitrarily large channels.
+- Streaming iteration over `iter_messages(reverse=True, min_id=watermark)` — memory stays flat on arbitrarily large channels (native and copy).
 - Per-batch flush + atomic watermark save — a crash mid-clone resumes cleanly without dupes or skips.
-- Per-batch error recovery: one bad message (expired media, MessageService, etc.) doesn't stall the run.
+- Per-batch error recovery: failed native batches binary-split so one bad message doesn't drop up to 99 good ones.
 
 **Pair management**
 - Long-running poller (`automate.py`): config-driven (source, dest, type) pairs on an interval. Watermarks survive restarts.
