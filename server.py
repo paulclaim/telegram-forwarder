@@ -46,6 +46,7 @@ from automate import (
     mapped_src_ids,
     record_mappings,
 )
+from retry_utils import ensure_connected, sleep_backoff
 
 # ───── State ──────────────────────────────────────────────────────────────
 
@@ -1014,16 +1015,25 @@ async def api_job_cancel(job_id: str):
 
 
 async def _scheduler_loop():
+    # Consecutive reconnect failures drive exponential backoff (30s → 10min).
+    # Resets to 0 on a successful connect so brief blips don't accumulate.
+    reconnect_fail_streak = 0
     while True:
         try:
-            if _dl and not _dl.client.is_connected():
-                print("[scheduler] client disconnected — reconnecting…", file=sys.stderr)
-                try:
-                    await _dl.client.connect()
-                except Exception as e:
-                    print(f"[scheduler] reconnect failed: {e}", file=sys.stderr)
-                    await asyncio.sleep(30)
-                    continue
+            if _dl and not await ensure_connected(_dl.client, label="scheduler"):
+                reconnect_fail_streak += 1
+                print(
+                    f"[scheduler] reconnect failed (streak={reconnect_fail_streak})",
+                    file=sys.stderr,
+                )
+                await sleep_backoff(
+                    reconnect_fail_streak - 1,
+                    base=30.0,
+                    cap=600.0,
+                    label="scheduler",
+                )
+                continue
+            reconnect_fail_streak = 0
             cfg = load_pairs() if _pairs_file_exists() else {"interval_seconds": 3600, "pairs": []}
             interval = max(60, int(cfg.get("interval_seconds", 3600)))
             pairs = cfg.get("pairs", [])
@@ -1042,6 +1052,14 @@ async def _scheduler_loop():
                 # pair out of the scheduler. Manual /api/pairs/<name>/run still works.
                 if pair.get("paused"):
                     continue
+                # Soft re-check between pairs: if the link died mid-cycle, stop
+                # burning through remaining pairs until the next reconnect pass.
+                if _dl and not await ensure_connected(_dl.client, label="scheduler"):
+                    print(
+                        "[scheduler] lost connection mid-cycle — remaining pairs deferred",
+                        file=sys.stderr,
+                    )
+                    break
                 name = _pair_key(pair)
                 job = _new_job(kind="pair-scheduled", label=f"pair:{name} (scheduled)")
                 try:
@@ -1052,6 +1070,14 @@ async def _scheduler_loop():
                     # No save_state here — see _bulk_runner comment.
                     job["finished_at"] = int(time.time())
                     _log_event({"kind": "run_finished", "pair": name, "result": result, "trigger": "scheduler", "job_id": job["id"]})
+                    # One pair aborted on a network blip; keep going to other
+                    # pairs (they may still succeed) rather than collapsing the
+                    # whole cycle.
+                    if isinstance(result, dict) and result.get("aborted_transient"):
+                        print(
+                            f"[scheduler] {name} aborted_transient — continuing other pairs",
+                            file=sys.stderr,
+                        )
                 except Exception as e:
                     job.update({"status": "error", "finished_at": int(time.time())})
                     print(f"scheduler error for {name}: {e}", file=sys.stderr)
@@ -1063,7 +1089,7 @@ async def _scheduler_loop():
             raise
         except Exception as e:
             print(f"scheduler loop crashed: {e}", file=sys.stderr)
-            await asyncio.sleep(60)
+            await sleep_backoff(0, base=60.0, cap=600.0, label="scheduler")
 
 
 # ───── Live edit/delete propagation ───────────────────────────────────────

@@ -72,6 +72,7 @@ See [CREDITS.md](CREDITS.md) for the inspiration we drew from tgcf (text replace
 - Live job tracker with per-pair progress bars and cancel buttons that work mid-scan (not just between message copies).
 - Watermark repair endpoint to roll a pair backwards (re-forward a range) or forwards (skip ahead after a clone).
 - FloodWait-aware throughout: sleeps when Telegram tells it to, retries cleanly.
+- Network blips (OpenWrt WAN flaps, DNS blips): scheduler reconnects with exponential backoff (30s → 10min); transient forward/download/upload failures abort the current pair run **without advancing the watermark**, so the next cycle retries the same messages. Permanent RPC errors still skip + advance to avoid infinite loops.
 
 ## When NOT to use this
 

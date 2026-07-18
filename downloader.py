@@ -19,6 +19,8 @@ from telethon.tl.functions.messages import GetForumTopicsRequest, ForwardMessage
 from telethon.tl.types import ForumTopic, MessageMediaWebPage, DocumentAttributeFilename, DocumentAttributeVideo, DocumentAttributeSticker, DocumentAttributeAnimated, UpdateNewChannelMessage, UpdateNewMessage
 from telethon.errors import FloodWaitError
 
+from retry_utils import is_transient_error, sleep_backoff
+
 if hasattr(sys.stdout, "reconfigure") and sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure") and sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
@@ -123,7 +125,19 @@ class TelegramDownloader:
         else:
             session_name = os.environ.get("TELETHON_SESSION_FILE", "tg_session")
             session = str(BASE_DIR / session_name)
-        self.client = TelegramClient(session, self.api_id, self.api_hash)
+        # connection_retries=None → Telethon keeps retrying forever on flaky
+        # links (OpenWrt WAN blips). Scheduler still does its own ensure_connect
+        # with exponential backoff as a second line of defence.
+        self.client = TelegramClient(
+            session,
+            self.api_id,
+            self.api_hash,
+            connection_retries=None,
+            retry_delay=1,
+            auto_reconnect=True,
+            request_retries=5,
+            timeout=30,
+        )
         await self.client.start()
         me = await self.client.get_me()
         print(f"✓ Logged in as: {me.first_name} (@{me.username})")
@@ -398,6 +412,8 @@ class TelegramDownloader:
         size = self._get_file_size(msg)
         timeout = self._transfer_timeout(size)
         temp_path = None
+        # Up to 3 attempts covering FloodWait and transient network/timeouts.
+        # Permanent errors re-raise immediately so the caller can skip + advance.
         for attempt in range(3):
             try:
                 temp_path = await asyncio.wait_for(
@@ -405,15 +421,25 @@ class TelegramDownloader:
                     timeout=timeout,
                 )
                 break
-            except asyncio.TimeoutError:
-                print(f"\n  ⏱ Skipping msg #{msg.id}: download timed out after {timeout:.0f}s")
-                self._unlink_quiet(safe_temp)
-                return None
             except FloodWaitError as fw:
                 print(f"\n  ⏳ Download flood wait {fw.seconds}s (attempt {attempt + 1}/3)...")
                 await asyncio.sleep(fw.seconds + 1)
-            except Exception:
+            except Exception as e:
+                if is_transient_error(e) and attempt < 2:
+                    print(
+                        f"\n  ⏳ Download msg #{msg.id} transient "
+                        f"{type(e).__name__}: {e} (attempt {attempt + 1}/3)"
+                    )
+                    self._unlink_quiet(safe_temp)
+                    await sleep_backoff(attempt, base=2.0, cap=60.0)
+                    continue
                 self._unlink_quiet(safe_temp)
+                if is_transient_error(e):
+                    print(
+                        f"\n  ⏱ Download msg #{msg.id} gave up after 3 attempts: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    return None
                 raise
         else:
             self._unlink_quiet(safe_temp)
@@ -505,19 +531,34 @@ class TelegramDownloader:
             except OSError:
                 pass
             timeout = self._transfer_timeout(size)
+            last_err = None
             for attempt in range(3):
                 try:
                     return await asyncio.wait_for(
                         self.client.send_file(dest_id, temp_path, **send_kwargs),
                         timeout=timeout,
                     )
-                except asyncio.TimeoutError:
-                    print(f"\n  ⏱ Skipping msg #{msg.id}: upload timed out after {timeout:.0f}s")
-                    return None
                 except FloodWaitError as fw:
+                    last_err = fw
                     print(f"\n  ⏳ Upload flood wait {fw.seconds}s (attempt {attempt + 1}/3)...")
                     await asyncio.sleep(fw.seconds + 1)
-            print(f"\n  ✗ Upload msg #{msg.id}: gave up after 3 flood-waits")
+                except Exception as e:
+                    last_err = e
+                    if is_transient_error(e) and attempt < 2:
+                        print(
+                            f"\n  ⏳ Upload msg #{msg.id} transient "
+                            f"{type(e).__name__}: {e} (attempt {attempt + 1}/3)"
+                        )
+                        await sleep_backoff(attempt, base=2.0, cap=60.0)
+                        continue
+                    if is_transient_error(e):
+                        print(
+                            f"\n  ⏱ Upload msg #{msg.id} gave up after 3 attempts: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        return None
+                    raise
+            print(f"\n  ✗ Upload msg #{msg.id}: gave up after 3 attempts ({last_err})")
             return None
         finally:
             self._unlink_quiet(temp_path)

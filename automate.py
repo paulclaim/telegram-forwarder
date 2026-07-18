@@ -22,6 +22,7 @@ from typing import Optional
 from telethon.errors import FloodWaitError, MessageNotModifiedError
 
 from downloader import TelegramDownloader, load_config
+from retry_utils import ensure_connected, is_transient_error
 
 BASE_DIR = Path(__file__).parent
 DEFAULT_PAIRS = BASE_DIR / "pairs.json"
@@ -349,6 +350,19 @@ async def run_pair(dl: TelegramDownloader, pair: dict, state: dict, job: Optiona
         return await _run_pair_locked(dl, pair, state, job)
 
 
+class TransientNetworkAbort(Exception):
+    """Stop the current pair run without advancing past a failed message.
+
+    Raised on single-message failures that look like temporary network blips.
+    The watermark stays at the last successful id so the next cycle retries.
+    """
+
+    def __init__(self, msg_id: int, err: BaseException):
+        self.msg_id = msg_id
+        self.err = err
+        super().__init__(f"msg #{msg_id}: {type(err).__name__}: {err}")
+
+
 async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job: Optional[dict] = None) -> dict:
     name = _pair_key(pair)
     # Transition job out of "queued" immediately so the dashboard shows the
@@ -375,6 +389,20 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
     replacements = pair.get("replacements") or []
 
     watermark = int(state.get(name, {}).get("last_msg_id", 0))
+
+    # Bail early if Telegram is unreachable — leave watermark untouched so the
+    # next scheduler cycle (after reconnect backoff) retries the same range.
+    if not await ensure_connected(dl.client, label=name):
+        print(f"[{name}] telegram not connected — skipping this run", file=sys.stderr)
+        if job:
+            job.update({"status": "error", "error": "not connected"})
+        return {
+            "forwarded": 0,
+            "failed": 0,
+            "last_id": watermark,
+            "aborted_transient": True,
+            "error": "not connected",
+        }
 
     # Pick transport: native server-side forward (fast, no bandwidth) when
     # allowed, otherwise copy-mode (download + re-upload). Native works for:
@@ -465,7 +493,12 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
 
         async def _forward_slice(msgs_batch) -> bool:
             """Forward one slice; binary-split on failure so one bad id doesn't
-            drop up to 99 good ones. Returns True if any msg was accepted."""
+            drop up to 99 good ones. Returns True if any msg was accepted.
+
+            Permanent single-msg failures skip + advance watermark. Transient
+            network failures raise TransientNetworkAbort so the run stops with
+            the watermark left at the last successful id.
+            """
             nonlocal ok, fail, last_ok_id, i
             if not msgs_batch:
                 return False
@@ -487,6 +520,16 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             if err is not None:
                 if len(msgs_batch) == 1:
                     m = msgs_batch[0]
+                    if is_transient_error(err):
+                        # Do NOT advance watermark — next cycle retries this id.
+                        print(
+                            f"[{name}] msg #{m.id} transient failure: "
+                            f"{type(err).__name__}: {err} — aborting run "
+                            f"(watermark stays at #{last_ok_id})",
+                            file=sys.stderr,
+                        )
+                        fail += 1
+                        raise TransientNetworkAbort(m.id, err)
                     print(f"[{name}] msg #{m.id} failed: {err} — skipping")
                     fail += 1
                     # Advance past the single bad message so we don't loop forever.
@@ -542,26 +585,45 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             batch.clear()
             return await _forward_slice(current)
 
-        async for m in dl.client.iter_messages(source, reverse=True, **iter_kwargs):
-            if job and job.get("cancel"):
-                print(f"[{name}] cancelled during scan at i={i}")
-                job["status"] = "cancelled"
-                break
-            if not _matches_type(m, ftype, dl):
-                continue
-            batch.append(m)
-            if len(batch) >= BATCH:
-                await _flush_batch()
-                if max_per_run and i >= max_per_run:
+        aborted_transient = False
+        try:
+            async for m in dl.client.iter_messages(source, reverse=True, **iter_kwargs):
+                if job and job.get("cancel"):
+                    print(f"[{name}] cancelled during scan at i={i}")
+                    job["status"] = "cancelled"
                     break
-                await asyncio.sleep(delay)
-        # Final partial batch.
-        if batch and not (job and job.get("cancel")):
-            await _flush_batch()
+                if not _matches_type(m, ftype, dl):
+                    continue
+                batch.append(m)
+                if len(batch) >= BATCH:
+                    await _flush_batch()
+                    if max_per_run and i >= max_per_run:
+                        break
+                    await asyncio.sleep(delay)
+            # Final partial batch.
+            if batch and not (job and job.get("cancel")) and not aborted_transient:
+                await _flush_batch()
+        except TransientNetworkAbort as abort:
+            aborted_transient = True
+            batch.clear()
+            print(
+                f"[{name}] aborted on transient network error at src#{abort.msg_id}; "
+                f"will retry from watermark=#{last_ok_id}",
+                file=sys.stderr,
+            )
+            if job and job.get("status") == "running":
+                job["status"] = "error"
+                job["error"] = str(abort)
         if job and job["status"] == "running":
             job["status"] = "finished"
-        print(f"[{name}] done: forwarded={ok} failed={fail} new_watermark=#{last_ok_id}")
-        return {"forwarded": ok, "failed": fail, "last_id": last_ok_id}
+        print(f"[{name}] done: forwarded={ok} failed={fail} new_watermark=#{last_ok_id}"
+              f"{' (aborted_transient)' if aborted_transient else ''}")
+        return {
+            "forwarded": ok,
+            "failed": fail,
+            "last_id": last_ok_id,
+            **({"aborted_transient": True} if aborted_transient else {}),
+        }
 
     # ── Copy-mode (protected source) — stream + download-ahead + ordered upload.
     # Streaming keeps memory flat (mirrors native). Download-ahead overlaps CDN
@@ -585,6 +647,9 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
     ready_event = asyncio.Event()
     producer_done = False
     cancelled = False
+    # Transient network abort: stop producer + uploader without advancing past
+    # the failed message (watermark stays at last successful id).
+    aborted_transient = False
     next_upload_idx = 0
     next_slot = 0
     skipped_oversize = 0
@@ -634,6 +699,8 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                     cancelled = True
                     print(f"[{name}] cancelled during stream at slot={next_slot}")
                     break
+                if aborted_transient:
+                    break
                 if not _matches_type(m, ftype, dl):
                     continue
                 if max_size_bytes > 0:
@@ -656,6 +723,8 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                 # Bound in-flight downloads roughly to concurrency so we don't
                 # queue thousands of tasks on a huge backlog.
                 while len(inflight) >= concurrency * 2:
+                    if aborted_transient or cancelled:
+                        break
                     await asyncio.sleep(0.05)
                     if job and job.get("cancel"):
                         cancelled = True
@@ -674,12 +743,16 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                 )
 
     async def _uploader():
-        nonlocal ok, fail, last_ok_id, next_upload_idx, cancelled
+        nonlocal ok, fail, last_ok_id, next_upload_idx, cancelled, aborted_transient
         processed = 0
         while True:
             if job and job.get("cancel"):
                 cancelled = True
+            if aborted_transient:
+                return
             while next_upload_idx not in ready:
+                if aborted_transient:
+                    return
                 if producer_done and next_upload_idx >= next_slot:
                     return
                 if cancelled and next_upload_idx not in ready:
@@ -704,11 +777,36 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             err = item["error"]
             processed += 1
 
+            def _abort_transient(reason: BaseException | str) -> None:
+                nonlocal aborted_transient, fail
+                aborted_transient = True
+                fail += 1
+                print(
+                    f"[{name}] transient failure at src#{m.id}: {reason} — "
+                    f"aborting copy run (watermark stays at #{last_ok_id})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if isinstance(payload, dict) and payload.get("kind") == "media":
+                    dl._unlink_quiet(payload.get("temp_path"))
+
             if err is not None:
                 print(f"[{name}] ✗ dl src#{m.id}: {err}", flush=True)
+                if is_transient_error(err):
+                    _abort_transient(err)
+                    return
+                # Permanent download error: skip this message and advance watermark
+                # so a single bad media item cannot stall the pair forever.
                 fail += 1
+                last_ok_id = max(last_ok_id, m.id)
+                now = int(time.time())
+                state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
+                await save_pair_watermark(name, last_ok_id, now)
             elif payload is None:
-                fail += 1
+                # download gave up after internal retries (timeouts etc.) — treat
+                # as transient so the next cycle re-tries this message.
+                _abort_transient("download returned no payload after retries")
+                return
             else:
                 try:
                     sent = await dl._send_copy_payload(
@@ -717,10 +815,19 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                     )
                 except Exception as e:
                     print(f"[{name}] ✗ ul src#{m.id}: {e}", flush=True)
+                    if is_transient_error(e):
+                        _abort_transient(e)
+                        return
                     if isinstance(payload, dict) and payload.get("kind") == "media":
                         dl._unlink_quiet(payload.get("temp_path"))
-                    sent = None
-                if sent:
+                    # Permanent upload error: skip + advance watermark.
+                    fail += 1
+                    last_ok_id = max(last_ok_id, m.id)
+                    now = int(time.time())
+                    state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
+                    await save_pair_watermark(name, last_ok_id, now)
+                    sent = "skipped_permanent"
+                if sent and sent != "skipped_permanent":
                     ok += 1
                     last_ok_id = m.id
                     now = int(time.time())
@@ -729,8 +836,21 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                     dest_msg_id = getattr(sent, "id", None)
                     if dest_msg_id is not None:
                         await record_mappings(name, [(m.id, dest_msg_id)])
-                else:
-                    fail += 1
+                elif sent is None and not aborted_transient:
+                    # upload returned None after internal retries → treat as
+                    # transient so the next cycle re-tries this message.
+                    _abort_transient("upload returned no result after retries")
+                    return
+
+            if aborted_transient:
+                if job:
+                    job.update({
+                        "done": processed, "ok": ok, "fail": fail,
+                        "last_id": last_ok_id, "total": max(next_slot, processed),
+                        "status": "error",
+                        "error": "transient network abort",
+                    })
+                return
 
             if job:
                 job.update({
@@ -758,17 +878,25 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             pass
 
     if job:
-        if cancelled or (job.get("cancel") and job.get("status") != "finished"):
+        if cancelled or (job.get("cancel") and job.get("status") not in ("finished", "error")):
             job["status"] = "cancelled"
+        elif aborted_transient and job.get("status") == "running":
+            job["status"] = "error"
+            job["error"] = "transient network abort"
         elif job.get("status") == "running":
             job["status"] = "finished"
 
-    if next_slot == 0:
+    if next_slot == 0 and not aborted_transient:
         print(f"[{name}] no new messages")
-    print(f"[{name}] done: forwarded={ok} failed={fail} new_watermark=#{last_ok_id}")
+    print(
+        f"[{name}] done: forwarded={ok} failed={fail} new_watermark=#{last_ok_id}"
+        f"{' (aborted_transient)' if aborted_transient else ''}"
+        f"{' (cancelled)' if cancelled and not aborted_transient else ''}"
+    )
     return {
         "forwarded": ok, "failed": fail, "last_id": last_ok_id,
-        **({"cancelled": True} if cancelled else {}),
+        **({"cancelled": True} if cancelled and not aborted_transient else {}),
+        **({"aborted_transient": True} if aborted_transient else {}),
     }
 
 
