@@ -45,6 +45,9 @@ from automate import (
     forget_mappings,
     mapped_src_ids,
     record_mappings,
+    load_retry_queue,
+    remove_retry_items,
+    drain_retry_queue,
 )
 from retry_utils import ensure_connected, sleep_backoff
 
@@ -521,6 +524,85 @@ async def api_set_watermark(name: str):
     await save_pair_watermark(name, wm, int(time.time()), allow_regression=True)
     _log_event({"kind": "watermark_set", "pair": name, "wm": wm})
     return jsonify({"ok": True, "pair": name, "watermark": wm})
+
+
+@app.route("/api/retry-queue")
+async def api_retry_queue_list():
+    """List parked messages that were auto-skipped after consecutive transient fails.
+
+    Query: ?pair=NAME&status=pending|dead  (both optional).
+    """
+    pair = request.args.get("pair")
+    status = request.args.get("status")
+    data = load_retry_queue()
+    items = list(data.get("items") or [])
+    if pair:
+        items = [it for it in items if it.get("pair") == pair]
+    if status:
+        items = [it for it in items if (it.get("status") or "pending") == status]
+    # Newest first for the UI.
+    items.sort(key=lambda it: int(it.get("enqueued_at") or 0), reverse=True)
+    pending = sum(1 for it in items if (it.get("status") or "pending") == "pending")
+    dead = sum(1 for it in items if it.get("status") == "dead")
+    return jsonify({
+        "items": items,
+        "counts": {"total": len(items), "pending": pending, "dead": dead},
+    })
+
+
+@app.route("/api/retry-queue/drain", methods=["POST"])
+async def api_retry_queue_drain():
+    """Re-attempt pending retry-queue items. Body (all optional):
+      {"pair": "lsp-media", "max_items": 10, "force": true}
+    force=true ignores retry_min_interval_seconds.
+    """
+    if not _dl:
+        return jsonify({"error": "telegram client not ready"}), 503
+    if _paused:
+        return jsonify({"error": "paused — POST /api/resume first"}), 409
+    body = {}
+    try:
+        body = await request.get_json(silent=True) or {}
+    except Exception:
+        body = {}
+    pair = body.get("pair")
+    max_items = int(body.get("max_items") or 10)
+    force = bool(body.get("force", False))
+    job = _new_job(
+        kind="retry-drain",
+        label=f"retry-queue{f' [{pair}]' if pair else ''} (max {max_items})",
+    )
+    _log_event({
+        "kind": "retry_drain_started",
+        "pair": pair, "max_items": max_items, "force": force, "job_id": job["id"],
+    })
+    try:
+        result = await drain_retry_queue(
+            _dl, pair_name=pair, max_items=max_items, force=force, job=job,
+        )
+        job["finished_at"] = int(time.time())
+        if job.get("status") == "running":
+            job["status"] = "finished"
+        _log_event({
+            "kind": "retry_drain_finished", "result": result, "job_id": job["id"],
+        })
+        return jsonify({"ok": True, "job_id": job["id"], **result})
+    except Exception as e:
+        job.update({"status": "error", "finished_at": int(time.time()), "error": str(e)})
+        _log_event({"kind": "retry_drain_error", "error": str(e), "job_id": job["id"]})
+        return jsonify({"error": str(e), "job_id": job["id"]}), 500
+
+
+@app.route("/api/retry-queue", methods=["DELETE"])
+async def api_retry_queue_delete():
+    """Remove items from the retry queue. Body: {"ids": ["pair:123", ...]}."""
+    body = await request.get_json(force=True)
+    ids = body.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"error": "ids must be a non-empty list"}), 400
+    removed = await remove_retry_items([str(x) for x in ids])
+    _log_event({"kind": "retry_queue_deleted", "ids": ids, "removed": removed})
+    return jsonify({"ok": True, "removed": removed})
 
 
 @app.route("/api/pairs/<name>/run", methods=["POST"])
@@ -1082,6 +1164,42 @@ async def _scheduler_loop():
                     job.update({"status": "error", "finished_at": int(time.time())})
                     print(f"scheduler error for {name}: {e}", file=sys.stderr)
                     _log_event({"kind": "run_error", "pair": name, "error": str(e), "trigger": "scheduler", "job_id": job["id"]})
+
+            # After the main pair cycle, drain a few parked retries so skipped
+            # media is eventually recovered without blocking watermarks.
+            if not _paused and _dl:
+                try:
+                    rq = load_retry_queue()
+                    pending_n = sum(
+                        1 for it in (rq.get("items") or [])
+                        if (it.get("status") or "pending") == "pending"
+                    )
+                    if pending_n:
+                        rjob = _new_job(
+                            kind="retry-drain",
+                            label=f"retry-queue (scheduled, pending={pending_n})",
+                        )
+                        _log_event({
+                            "kind": "retry_drain_started",
+                            "trigger": "scheduler",
+                            "pending": pending_n,
+                            "job_id": rjob["id"],
+                        })
+                        rresult = await drain_retry_queue(
+                            _dl, max_items=3, force=False, job=rjob,
+                        )
+                        rjob["finished_at"] = int(time.time())
+                        if rjob.get("status") == "running":
+                            rjob["status"] = "finished"
+                        _log_event({
+                            "kind": "retry_drain_finished",
+                            "trigger": "scheduler",
+                            "result": rresult,
+                            "job_id": rjob["id"],
+                        })
+                except Exception as e:
+                    print(f"[scheduler] retry-queue drain error: {e}", file=sys.stderr)
+
             next_run = datetime.fromtimestamp(time.time() + interval, tz=timezone.utc).strftime('%H:%M:%S UTC')
             print(f"[scheduler] cycle done — sleeping {interval}s, next run at {next_run}", file=sys.stderr)
             await asyncio.sleep(interval)

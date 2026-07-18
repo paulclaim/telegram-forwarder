@@ -72,7 +72,7 @@ See [CREDITS.md](CREDITS.md) for the inspiration we drew from tgcf (text replace
 - Live job tracker with per-pair progress bars and cancel buttons that work mid-scan (not just between message copies).
 - Watermark repair endpoint to roll a pair backwards (re-forward a range) or forwards (skip ahead after a clone).
 - FloodWait-aware throughout: sleeps when Telegram tells it to, retries cleanly.
-- Network blips (OpenWrt WAN flaps, DNS blips): scheduler reconnects with exponential backoff (30s → 10min); transient forward/download/upload failures abort the current pair run **without advancing the watermark**, so the next cycle retries the same messages. Permanent RPC errors still skip + advance to avoid infinite loops.
+- Network blips (OpenWrt WAN flaps, DNS blips): scheduler reconnects with exponential backoff (30s → 10min); transient forward/download/upload failures abort the current pair run **without advancing the watermark**, so the next cycle retries the same messages. After `transient_skip_after` consecutive failures on the **same** msg id (default 3), that message is **parked in `retry_queue.json`** and the watermark advances — so one stuck large file cannot block the pair forever, but the media is not lost. The scheduler drains a few pending queue items each cycle; you can also force a drain via `POST /api/retry-queue/drain`. Permanent RPC errors still skip + advance immediately (not queued — they won't succeed on retry either).
 
 ## When NOT to use this
 
@@ -264,6 +264,9 @@ python automate.py
 | `drop_author` | no | `true` | Strip "Forwarded from X" header on native forwards. Requires Premium sending account. |
 | `paused` | no | `false` | `true` makes the scheduler skip this pair. Manual `/api/pairs/<name>/run` still works. |
 | `max_file_size_mb` | no | `0` (unlimited) | Copy-mode only: skip messages whose media exceeds this cap **before** download. |
+| `transient_skip_after` | no | `3` | Consecutive transient failures on the **same** msg id before park-to-retry-queue + advance watermark. `0` = never auto-skip (retry forever). |
+| `retry_min_interval_seconds` | no | `900` | Min seconds between automatic re-attempts of a parked item (scheduler drain). |
+| `retry_max_attempts` | no | `20` | Drain attempts before marking an item `dead` (stays in queue for manual review). `0` = unlimited. |
 | `replacements` | no | `[]` | List of `{find, replace, regex?}` rules. Forwards natively + edits caption after — does **not** force copy-mode. |
 
 `RUN_ONCE_AND_EXIT=1 python automate.py` runs one pass and exits — useful for testing or one-shot cron jobs.

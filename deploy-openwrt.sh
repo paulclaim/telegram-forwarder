@@ -104,6 +104,7 @@ rsync -avz --delete \
   --exclude='tg_session.session' --exclude='*.session' --exclude='*.session-journal' \
   --exclude='config.json' --exclude='pairs.json' --exclude='sources.json' \
   --exclude='watermarks.json' --exclude='message_map.json' --exclude='run_log.json' \
+  --exclude='retry_queue.json' \
   --exclude='downloads' --exclude='temp' --exclude='data' --exclude='.env' \
   ./ "$SSH_HOST:$REMOTE_DIR/" 2>&1 | grep -vE '/$' | tail -20
 log "代码同步完成"
