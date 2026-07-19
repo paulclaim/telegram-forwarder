@@ -38,9 +38,11 @@ from automate import (
     save_pair_watermark,
     run_pair,
     _pair_key,
+    _get_pair_lock,
     _matches_type,
     apply_replacements,
     load_message_map,
+    flush_message_map,
     lookup_dest_id,
     forget_mappings,
     mapped_src_ids,
@@ -60,6 +62,8 @@ app.jinja_env.auto_reload = True
 
 DASH_USER = os.environ.get("DASH_USER", "admin")
 DASH_PASS = os.environ.get("DASH_PASS")  # if unset, auth disabled (local dev only)
+# Set ALLOW_INSECURE_OPEN_DASH=1 to silence the open-dash warning (e.g. SSH-tunnel only).
+ALLOW_INSECURE_OPEN_DASH = os.environ.get("ALLOW_INSECURE_OPEN_DASH", "").strip() in ("1", "true", "yes")
 
 _state_lock = asyncio.Lock()        # protects pairs.json + watermarks.json + run_log
 _dl: Optional[TelegramDownloader] = None  # shared Telegram client
@@ -113,9 +117,8 @@ def _log_event(event: dict) -> None:
     if len(_run_log) > _RUN_LOG_MAX:
         del _run_log[: len(_run_log) - _RUN_LOG_MAX]
     try:
-        RUN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(RUN_LOG_PATH, "w", encoding="utf-8") as f:
-            json.dump(_run_log[-_RUN_LOG_MAX:], f)
+        from automate import _atomic_write_json
+        _atomic_write_json(RUN_LOG_PATH, _run_log[-_RUN_LOG_MAX:])
     except Exception:
         pass
 
@@ -177,7 +180,25 @@ async def index():
 
 @app.route("/healthz")
 async def healthz():
-    return jsonify({"ok": True, "telegram_ready": _dl is not None and _dl.client is not None})
+    """Liveness + Telegram readiness.
+
+    - ok: process is serving
+    - telegram_ready: client object exists
+    - telegram_connected: client reports is_connected() (best-effort probe)
+    """
+    ready = _dl is not None and _dl.client is not None
+    connected = False
+    if ready:
+        try:
+            connected = bool(_dl.client.is_connected())
+        except Exception:
+            connected = False
+    status = 200 if ready else 503
+    return jsonify({
+        "ok": True,
+        "telegram_ready": ready,
+        "telegram_connected": connected,
+    }), status
 
 
 # ───── Routes: chats ──────────────────────────────────────────────────────
@@ -194,7 +215,7 @@ async def api_chats():
         import traceback
         tb = traceback.format_exc()
         print(f"[api/chats] ERROR: {type(e).__name__}: {e}\n{tb}", file=sys.stderr)
-        return jsonify({"error": f"{type(e).__name__}: {e}", "detail": tb}), 500
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
     return jsonify({"chats": chats})
 
 
@@ -393,7 +414,10 @@ async def api_pair_gaps(name: str):
 async def api_pair_repair(name: str):
     """Forward the specific src ids passed in body — bypasses watermark logic.
     Body: {"src_ids": [123, 456, ...]} — typically the output of /gaps.
-    Uses native batched forward (raw ForwardMessagesRequest) when allowed."""
+    Uses native batched forward when allowed; falls back to copy-mode for
+    protected (noforwards) sources. Holds the per-pair lock so concurrent
+    run_pair / drain cannot double-post.
+    """
     if not _dl:
         return jsonify({"error": "telegram client not ready"}), 503
     if _paused:
@@ -412,43 +436,99 @@ async def api_pair_repair(name: str):
     dest = pair["dest"]
     dest_topic = pair.get("dest_topic")
     drop_author = bool(pair.get("drop_author", True))
+    replacements = pair.get("replacements") or []
+
+    pair_lock = _get_pair_lock(name)
+    if pair_lock.locked():
+        return jsonify({"error": f"pair '{name}' is already running"}), 409
 
     job = _new_job(kind="pair-repair", label=f"pair:{name} (repair {len(src_ids)} msgs)")
     job["total"] = len(src_ids)
     job["status"] = "running"
     _log_event({"kind": "repair_started", "pair": name, "count": len(src_ids), "job_id": job["id"]})
 
-    # Fetch source messages by id (Telethon: get_messages with explicit ids).
-    msgs = await _dl.client.get_messages(source, ids=src_ids)
-    msgs = [m for m in msgs if m is not None]
-    # Batch in 100s — Telegram cap on forwardMessages.
-    ok, fail = 0, 0
-    BATCH = 100
-    for i in range(0, len(msgs), BATCH):
-        if job.get("cancel"):
-            job["status"] = "cancelled"
-            break
-        batch = msgs[i:i + BATCH]
-        try:
-            forwarded = await _dl.forward_batch(source, dest, batch, drop_author=drop_author, top_msg_id=dest_topic)
-            mappings = []
-            for src_msg, fwd in zip(batch, forwarded):
-                if fwd is not None:
-                    ok += 1
-                    mappings.append((src_msg.id, getattr(fwd, "id", None)))
-                else:
-                    fail += 1
-            if mappings:
-                await record_mappings(name, mappings)
-        except Exception as e:
-            print(f"[repair {name}] batch failed: {e}")
-            fail += len(batch)
-        job.update({"done": min(i + BATCH, len(msgs)), "ok": ok, "fail": fail})
+    async with pair_lock:
+        # Fetch source messages by id (Telethon: get_messages with explicit ids).
+        msgs = await _dl.client.get_messages(source, ids=src_ids)
+        msgs = [m for m in msgs if m is not None]
+        protected = await _dl.is_source_protected(source)
+        ok, fail = 0, 0
+
+        if protected:
+            import shutil
+            import uuid as _uuid
+            run_temp = BASE_DIR / "temp" / f"repair-{_uuid.uuid4().hex[:10]}"
+            run_temp.mkdir(parents=True, exist_ok=True)
+            try:
+                for i, m in enumerate(msgs, 1):
+                    if job.get("cancel"):
+                        job["status"] = "cancelled"
+                        break
+                    override = None
+                    if replacements and m.message:
+                        transformed = apply_replacements(m.message, replacements)
+                        if transformed != m.message:
+                            override = transformed
+                    try:
+                        sent = await _dl._copy_message_to(
+                            m, dest, dest_topic=dest_topic,
+                            text_override=override, temp_dir=run_temp,
+                        )
+                        if sent is not None:
+                            ok += 1
+                            dest_id = getattr(sent, "id", None)
+                            if dest_id is not None:
+                                await record_mappings(name, [(m.id, dest_id)])
+                        else:
+                            fail += 1
+                    except Exception as e:
+                        print(f"[repair {name}] copy #{m.id} failed: {e}", file=sys.stderr)
+                        fail += 1
+                    job.update({"done": i, "ok": ok, "fail": fail})
+            finally:
+                shutil.rmtree(run_temp, ignore_errors=True)
+        else:
+            BATCH = 100
+            for i in range(0, len(msgs), BATCH):
+                if job.get("cancel"):
+                    job["status"] = "cancelled"
+                    break
+                batch = msgs[i:i + BATCH]
+                try:
+                    forwarded = await _dl.forward_batch(
+                        source, dest, batch, drop_author=drop_author, top_msg_id=dest_topic,
+                    )
+                    mappings = []
+                    for src_msg, fwd in zip(batch, forwarded):
+                        if fwd is not None:
+                            ok += 1
+                            dest_id = getattr(fwd, "id", None)
+                            mappings.append((src_msg.id, dest_id))
+                            if replacements and src_msg.message and dest_id is not None:
+                                new_text = apply_replacements(src_msg.message, replacements)
+                                if new_text != src_msg.message:
+                                    try:
+                                        await _dl.client.edit_message(
+                                            dest, dest_id, new_text, parse_mode=None,
+                                        )
+                                    except MessageNotModifiedError:
+                                        pass
+                                    except Exception as e:
+                                        print(f"[repair {name}] edit after forward failed: {e}")
+                        else:
+                            fail += 1
+                    if mappings:
+                        await record_mappings(name, mappings)
+                except Exception as e:
+                    print(f"[repair {name}] batch failed: {e}")
+                    fail += len(batch)
+                job.update({"done": min(i + BATCH, len(msgs)), "ok": ok, "fail": fail})
+
     job["finished_at"] = int(time.time())
     if job["status"] == "running":
         job["status"] = "finished"
     _log_event({"kind": "repair_finished", "pair": name, "ok": ok, "fail": fail, "job_id": job["id"]})
-    return jsonify({"ok": True, "forwarded": ok, "failed": fail, "job_id": job["id"]})
+    return jsonify({"ok": True, "forwarded": ok, "failed": fail, "job_id": job["id"], "mode": "copy" if protected else "native"})
 
 
 @app.route("/api/multi-forward", methods=["POST"])
@@ -517,11 +597,18 @@ async def api_multi_forward():
 async def api_set_watermark(name: str):
     """Manually set a pair's watermark. Body: {"last_msg_id": int}.
     Used to repair clobbered watermarks (see 2026-05-19 race) or to skip ahead.
+
+    Refuses while the pair is mid-run so an in-flight runner cannot race the
+    repaired value (or re-forward against a stale min_id snapshot).
     """
     body = await request.get_json(force=True)
     wm = int(body.get("last_msg_id", 0))
-    # Manual repair allowed to roll backwards (e.g., to re-forward a range).
-    await save_pair_watermark(name, wm, int(time.time()), allow_regression=True)
+    pair_lock = _get_pair_lock(name)
+    if pair_lock.locked():
+        return jsonify({"error": f"pair '{name}' is running — pause/wait, then set watermark"}), 409
+    async with pair_lock:
+        # Manual repair allowed to roll backwards (e.g., to re-forward a range).
+        await save_pair_watermark(name, wm, int(time.time()), allow_regression=True)
     _log_event({"kind": "watermark_set", "pair": name, "wm": wm})
     return jsonify({"ok": True, "pair": name, "watermark": wm})
 
@@ -828,17 +915,23 @@ async def api_forward_once():
     if source_topic and source_topic > 1:
         iter_kwargs["reply_to"] = source_topic
 
+    # Collect matching msgs in reverse (newest first from iter_messages), then
+    # sort ascending. Cap list growth via limit so large one-shots stay bounded.
     msgs = []
+    scanned = 0
     async for m in _dl.client.iter_messages(source, **iter_kwargs):
+        scanned += 1
         if job.get("cancel"):
             print(f"[oneshot {source}->{dest}] cancelled during scan ({len(msgs)} matched)")
             job["status"] = "cancelled"
             job["finished_at"] = int(time.time())
             return jsonify({"ok": True, "result": {
-                "forwarded": 0, "failed": 0, "scanned": len(msgs), "cancelled": True, "mode": mode,
+                "forwarded": 0, "failed": 0, "scanned": scanned, "cancelled": True, "mode": mode,
             }, "job_id": job["id"]})
         if _matches_type(m, ftype, _dl):
             msgs.append(m)
+            if limit and len(msgs) >= limit:
+                break
     msgs.sort(key=lambda m: m.id)
 
     job["total"] = len(msgs)
@@ -846,7 +939,8 @@ async def api_forward_once():
     ok = fail = 0
     try:
         if not protected:
-            # Native batch path — no local media I/O.
+            # Native batch path — no local media I/O. Stream batches without
+            # holding extra state beyond the matched list (already capped).
             BATCH = 100
             i = 0
             for start in range(0, len(msgs), BATCH):
@@ -880,30 +974,33 @@ async def api_forward_once():
                 if start + BATCH < len(msgs):
                     await asyncio.sleep(delay)
         else:
-            (BASE_DIR / "temp").mkdir(exist_ok=True)
-            for i, m in enumerate(msgs, 1):
-                if job.get("cancel"):
-                    job["status"] = "cancelled"
-                    break
-                success = await _dl._copy_message_to(m, dest, dest_topic=dest_topic)
-                if success:
-                    ok += 1
-                else:
-                    fail += 1
-                job.update({"done": i, "ok": ok, "fail": fail, "last_id": m.id})
-                await asyncio.sleep(delay)
+            import shutil
+            import uuid as _uuid
+            run_temp = BASE_DIR / "temp" / f"oneshot-{_uuid.uuid4().hex[:10]}"
+            run_temp.mkdir(parents=True, exist_ok=True)
+            try:
+                for i, m in enumerate(msgs, 1):
+                    if job.get("cancel"):
+                        job["status"] = "cancelled"
+                        break
+                    success = await _dl._copy_message_to(
+                        m, dest, dest_topic=dest_topic, temp_dir=run_temp,
+                    )
+                    if success:
+                        ok += 1
+                    else:
+                        fail += 1
+                    job.update({"done": i, "ok": ok, "fail": fail, "last_id": m.id})
+                    await asyncio.sleep(delay)
+            finally:
+                shutil.rmtree(run_temp, ignore_errors=True)
         if job["status"] != "cancelled":
             job["status"] = "finished"
     finally:
         job["finished_at"] = int(time.time())
-        try:
-            import shutil
-            shutil.rmtree(BASE_DIR / "temp", ignore_errors=True)
-        except Exception:
-            pass
 
     result = {
-        "forwarded": ok, "failed": fail, "scanned": len(msgs),
+        "forwarded": ok, "failed": fail, "scanned": scanned,
         "cancelled": job["status"] == "cancelled", "mode": mode,
     }
     _log_event({"kind": "oneshot_finished", "source": source, "dest": dest, "result": result, "job_id": job["id"]})
@@ -1257,6 +1354,7 @@ async def _on_source_edited(event) -> None:
                 int(pair["dest"]),
                 dest_msg_id,
                 new_text,
+                parse_mode=None,
                 formatting_entities=None if text_was_transformed else msg.entities,
             )
             _log_event({"kind": "live_edit", "pair": name, "src_id": src_msg_id, "dest_id": dest_msg_id})
@@ -1352,11 +1450,22 @@ async def _startup():
     except Exception as e:
         print(f"[startup] pair entity warmup failed (non-fatal): {e}", file=sys.stderr)
     _scheduler_task = asyncio.create_task(_scheduler_loop())
+    if not DASH_PASS and not ALLOW_INSECURE_OPEN_DASH:
+        print(
+            "[startup] WARNING: DASH_PASS unset — web UI has NO authentication. "
+            "Set DASH_PASS, or ALLOW_INSECURE_OPEN_DASH=1 if intentional "
+            "(e.g. SSH tunnel only).",
+            file=sys.stderr,
+        )
     print(f"server ready — dash_user={DASH_USER!r} auth={'on' if DASH_PASS else 'OFF (set DASH_PASS)'}")
 
 
 @app.after_serving
 async def _shutdown():
+    try:
+        await flush_message_map()
+    except Exception as e:
+        print(f"[shutdown] flush_message_map failed: {e}", file=sys.stderr)
     if _scheduler_task:
         _scheduler_task.cancel()
     if _dl:

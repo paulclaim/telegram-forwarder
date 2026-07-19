@@ -365,7 +365,7 @@ class TelegramDownloader:
 
     # ─── Copy (download + re-upload, bypasses restrictions) ──────
 
-    async def _download_copy_media(self, msg) -> Optional[dict]:
+    async def _download_copy_media(self, msg, *, temp_dir: Optional[Path] = None) -> Optional[dict]:
         """Download media for copy-mode, or classify a text-only message.
 
         Returns one of:
@@ -375,15 +375,20 @@ class TelegramDownloader:
            "animated_attr": ..., "is_video_document": bool}
           None — nothing to send, or download failed
         Caller owns cleanup of temp_path (via _send_copy_payload or _unlink_quiet).
+
+        *temp_dir*: optional per-run directory (recommended). Defaults to
+        ``BASE_DIR/temp`` with a unique filename so concurrent pairs don't
+        clobber ``tmp_{msg.id}``.
         """
         if not msg.media or isinstance(msg.media, MessageMediaWebPage):
             if msg.message:
                 return {"kind": "text"}
             return None
 
-        temp_dir = BASE_DIR / "temp"
-        temp_dir.mkdir(exist_ok=True)
-        # Use msg.id-based temp name to avoid Windows-invalid chars in original filenames
+        import uuid as _uuid
+        out_dir = Path(temp_dir) if temp_dir is not None else (BASE_DIR / "temp")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Unique name: same msg.id can be downloaded by concurrent pairs / runs.
         original_name = None
         ext = ""
         video_attr = None
@@ -408,7 +413,7 @@ class TelegramDownloader:
                 ext = self.MIME_TO_EXT.get(mime, "")
         elif msg.photo:
             ext = ".jpg"
-        safe_temp = temp_dir / f"tmp_{msg.id}{ext}"
+        safe_temp = out_dir / f"tmp_{msg.id}_{_uuid.uuid4().hex[:8]}{ext}"
         size = self._get_file_size(msg)
         timeout = self._transfer_timeout(size)
         temp_path = None
@@ -564,17 +569,19 @@ class TelegramDownloader:
             self._unlink_quiet(temp_path)
 
     async def _copy_message_to(self, msg, dest_id: int | str, dest_topic: Optional[int] = None,
-                               text_override: Optional[str] = None):
+                               text_override: Optional[str] = None,
+                               temp_dir: Optional[Path] = None):
         # dest_topic: forum supergroup topic id. None or 1 = General/no topic.
         # text_override: replaces msg.message verbatim (drops entities since
         # offsets would be wrong). Used by automate's per-pair replacements.
+        # temp_dir: optional per-run download directory (see _download_copy_media).
         # Returns the sent Message on success, None on failure.
         #
         # Download and upload are split so automate's copy pipeline can
         # download-ahead; this method composes them for sequential callers.
         # FloodWait is handled inside _download_copy_media / _send_copy_payload.
         try:
-            payload = await self._download_copy_media(msg)
+            payload = await self._download_copy_media(msg, temp_dir=temp_dir)
             if payload is None:
                 return None
             return await self._send_copy_payload(
@@ -593,8 +600,14 @@ class TelegramDownloader:
         forward into a forum-topic destination without falling back to copy-mode.
         Returns a list of forwarded Message objects (same length as input,
         with None for any that the server didn't echo back in the Updates).
+
+        Alignment strategy (in order):
+          1. random_id → UpdateNew* message / UpdateMessageID
+          2. leftover new messages in Updates order (fallback when random_id
+             is missing on channel messages)
         """
         import random
+        from telethon.tl.types import UpdateMessageID
         from_peer = await self.client.get_input_entity(source)
         to_peer = await self.client.get_input_entity(dest)
         ids = [m.id for m in msgs]
@@ -609,34 +622,48 @@ class TelegramDownloader:
         if top_msg_id and top_msg_id > 1:
             kwargs["top_msg_id"] = top_msg_id
         result = await self.client(ForwardMessagesRequest(**kwargs))
-        # Result is an Updates object. Pull out the newly-created messages
-        # by matching random_id back to the input order.
+
         rid_to_msg: dict[int, object] = {}
-        for upd in getattr(result, "updates", []):
+        rid_to_dest_id: dict[int, int] = {}
+        ordered_new: list = []  # UpdateNew* messages in arrival order
+        for upd in getattr(result, "updates", []) or []:
             if isinstance(upd, (UpdateNewChannelMessage, UpdateNewMessage)):
                 msg = upd.message
+                ordered_new.append(msg)
                 rid = getattr(msg, "random_id", None) or getattr(upd, "random_id", None)
                 if rid is not None:
                     rid_to_msg[rid] = msg
-        # Telethon sometimes exposes random_id mapping via result.updates with
-        # UpdateMessageID. Fall back to scanning those too.
-        from telethon.tl.types import UpdateMessageID
-        rid_to_dest_id: dict[int, int] = {}
-        for upd in getattr(result, "updates", []):
-            if isinstance(upd, UpdateMessageID):
+            elif isinstance(upd, UpdateMessageID):
                 rid_to_dest_id[upd.random_id] = upd.id
+
+        class _Stub:
+            __slots__ = ("id",)
+
+            def __init__(self, mid: int):
+                self.id = mid
+
         out: list = []
+        used_msgs: set[int] = set()  # id() of message objects already claimed
         for rid in random_ids:
             if rid in rid_to_msg:
-                out.append(rid_to_msg[rid])
+                msg = rid_to_msg[rid]
+                out.append(msg)
+                used_msgs.add(id(msg))
             elif rid in rid_to_dest_id:
-                # Synthesize a minimal stub so caller can read .id
-                class _Stub: pass
-                s = _Stub()
-                s.id = rid_to_dest_id[rid]
-                out.append(s)
+                out.append(_Stub(rid_to_dest_id[rid]))
             else:
                 out.append(None)
+
+        # Fallback: fill remaining Nones with unused new messages in order.
+        # Telegram usually echoes forwards in the same order as input ids.
+        if any(x is None for x in out) and ordered_new:
+            leftover = [m for m in ordered_new if id(m) not in used_msgs]
+            li = 0
+            for i, item in enumerate(out):
+                if item is None and li < len(leftover):
+                    out[i] = leftover[li]
+                    li += 1
+
         return out
 
     # ─── Forward topic ────────────────────────────────────────────
@@ -703,24 +730,24 @@ class TelegramDownloader:
         print(f"   Sending {total} messages...\n")
 
         if protected:
-            (BASE_DIR / "temp").mkdir(exist_ok=True)
-            for i, msg in enumerate(messages_to_send, 1):
-                success = await self._copy_message_to(msg, dest_id)
-                if success:
-                    stats["forwarded"] += 1
-                else:
-                    stats["failed"] += 1
-
-                print(f"  {'✓' if success else '✗'} {i}/{total} (msg #{msg.id})", end="\r", flush=True)
-                if on_progress:
-                    on_progress(i, total)
-                await asyncio.sleep(delay)
-
+            import shutil
+            import uuid as _uuid
+            run_temp = BASE_DIR / "temp" / f"topic-{_uuid.uuid4().hex[:10]}"
+            run_temp.mkdir(parents=True, exist_ok=True)
             try:
-                import shutil
-                shutil.rmtree(BASE_DIR / "temp", ignore_errors=True)
-            except Exception:
-                pass
+                for i, msg in enumerate(messages_to_send, 1):
+                    success = await self._copy_message_to(msg, dest_id, temp_dir=run_temp)
+                    if success:
+                        stats["forwarded"] += 1
+                    else:
+                        stats["failed"] += 1
+
+                    print(f"  {'✓' if success else '✗'} {i}/{total} (msg #{msg.id})", end="\r", flush=True)
+                    if on_progress:
+                        on_progress(i, total)
+                    await asyncio.sleep(delay)
+            finally:
+                shutil.rmtree(run_temp, ignore_errors=True)
         else:
             # Native batch. Prefer ForwardMessagesRequest so we can target a
             # forum-topic destination via top_msg_id when dest is a forum.
@@ -785,6 +812,9 @@ class TelegramDownloader:
                 or (forward_type == "media" and self._is_media(msg))
                 or (forward_type == "documents" and self._is_document(msg))
                 or (forward_type == "messages" and msg.message and not msg.media)
+                or (forward_type == "docs_and_text" and (
+                    self._is_document(msg) or (msg.message and not msg.media)
+                ))
             )
             if should:
                 messages_to_forward.append(msg)
@@ -796,22 +826,23 @@ class TelegramDownloader:
         print(f"   Found {total} to forward\n")
 
         if protected:
-            (BASE_DIR / "temp").mkdir(exist_ok=True)
-            for i, msg in enumerate(messages_to_forward, 1):
-                ok = await self._copy_message_to(msg, dest_id)
-                if ok:
-                    stats["forwarded"] += 1
-                else:
-                    stats["failed"] += 1
-                print(f"  {'✓' if ok else '✗'} {i}/{total} (msg #{msg.id})", end="\r", flush=True)
-                if on_progress:
-                    on_progress(i, total)
-                await asyncio.sleep(delay)
+            import shutil
+            import uuid as _uuid
+            run_temp = BASE_DIR / "temp" / f"chat-{_uuid.uuid4().hex[:10]}"
+            run_temp.mkdir(parents=True, exist_ok=True)
             try:
-                import shutil
-                shutil.rmtree(BASE_DIR / "temp", ignore_errors=True)
-            except Exception:
-                pass
+                for i, msg in enumerate(messages_to_forward, 1):
+                    ok = await self._copy_message_to(msg, dest_id, temp_dir=run_temp)
+                    if ok:
+                        stats["forwarded"] += 1
+                    else:
+                        stats["failed"] += 1
+                    print(f"  {'✓' if ok else '✗'} {i}/{total} (msg #{msg.id})", end="\r", flush=True)
+                    if on_progress:
+                        on_progress(i, total)
+                    await asyncio.sleep(delay)
+            finally:
+                shutil.rmtree(run_temp, ignore_errors=True)
         else:
             batch_size = 100
             for i in range(0, total, batch_size):

@@ -2,6 +2,10 @@
 
 # telegram-forwarder — procd service
 # Starts the Quart web UI + background scheduler for Telegram channel mirroring.
+#
+# Auth: set DASH_PASS in the environment before start.
+# Without DASH_PASS the UI is open; set ALLOW_INSECURE_OPEN_DASH=1 only if
+# that is intentional (e.g. access only via SSH tunnel).
 
 USE_PROCD=1
 START=99
@@ -17,6 +21,8 @@ start_service() {
     procd_set_param env PORT="$PORT"
     procd_set_param env DASH_USER="${DASH_USER:-admin}"
     procd_set_param env DASH_PASS="${DASH_PASS:-}"
+    # Uncomment only if you intentionally run without auth (tunnel-only):
+    # procd_set_param env ALLOW_INSECURE_OPEN_DASH=1
     procd_set_param cwd "$APP_DIR"
     procd_set_param stdout 1
     procd_set_param stderr 1

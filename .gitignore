@@ -3,6 +3,7 @@ pairs.json
 watermarks.json
 run_log.json
 message_map.json
+retry_queue.json
 .pairs_from_env.json
 *.session
 *.session-journal

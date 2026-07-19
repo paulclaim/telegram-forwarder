@@ -107,7 +107,7 @@ docker run -d --name tg-forwarder \
   ghcr.io/apppurchasespro-hash/telegram-forwarder:latest
 ```
 
-UI on <http://localhost:5000>. The `/app/data` volume keeps `pairs.json`, `watermarks.json`, `run_log.json`, and `message_map.json` across container restarts and image upgrades.
+UI on <http://localhost:5000>. The `/app/data` volume keeps `pairs.json`, `watermarks.json`, `run_log.json`, `message_map.json`, and `retry_queue.json` across container restarts and image upgrades.
 
 ### Option B — From source
 
@@ -363,9 +363,9 @@ Required env vars per container:
 | `TELETHON_SESSION_STRING` | from `python convert_session.py tg_session_acctN` |
 | `DASH_USER` | username for the web UI Basic Auth |
 | `DASH_PASS` | password for the web UI Basic Auth (set this — if unset, UI is open) |
-| `MSG_MAP_PATH` | `/app/data/message_map.json` (override the default so state survives restarts) |
+| `MSG_MAP_PATH` | `/app/data/message_map.json` (baked into Dockerfile; override only if needed) |
 
-`STATE_PATH`, `PAIRS_PATH`, `RUN_LOG_PATH` are baked into the Dockerfile and don't need to be set. Optional `PAIRS_JSON` and `INITIAL_WATERMARKS_JSON` seed the data dir on first boot.
+`STATE_PATH`, `PAIRS_PATH`, `RUN_LOG_PATH`, `MSG_MAP_PATH`, and `RETRY_QUEUE_PATH` are baked into the Dockerfile and don't need to be set. Optional `PAIRS_JSON` and `INITIAL_WATERMARKS_JSON` seed the data dir on first boot.
 
 The old Railway config (`railway.json` + a one-shot data backup) has been moved to `archive/railway/` (gitignored). Re-enable it by moving the file back to the repo root — nothing in the codebase depends on its location.
 

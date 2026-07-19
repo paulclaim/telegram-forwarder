@@ -14,8 +14,10 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -46,6 +48,29 @@ def _resolve_msg_map_path() -> Path:
 
 def _resolve_retry_queue_path() -> Path:
     return Path(os.environ.get("RETRY_QUEUE_PATH", str(DEFAULT_RETRY_QUEUE)))
+
+
+def _atomic_write_json(path: Path, data, *, indent=None, sort_keys: bool = False) -> None:
+    """Write JSON via temp file + fsync + os.replace (crash-safe).
+
+    Unique temp suffix avoids leftover collisions across processes; replace is
+    atomic on the same filesystem so readers never see a half-written file.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=indent, sort_keys=sort_keys)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 # Per-pair regex find/replace rules applied to message text + caption in
@@ -83,11 +108,20 @@ def apply_replacements(text: Optional[str], rules: Optional[list]) -> str:
 _msg_map: dict[str, dict[str, int]] = {}
 _msg_map_lock = asyncio.Lock()
 _msg_map_loaded = False
+# Deferred flush: copy-mode writes one mapping per msg; dumping the full JSON
+# each time thrash-writes flash on OpenWrt. Coalesce until N dirty entries or
+# an explicit flush_message_map() at end of run / forget / shutdown.
+_msg_map_dirty: int = 0
+_MSG_MAP_FLUSH_EVERY = 25
 
 
 def load_message_map() -> dict:
-    """Read from disk into in-memory _msg_map. Idempotent."""
-    global _msg_map, _msg_map_loaded
+    """Read from disk into in-memory _msg_map. Idempotent.
+
+    Corrupt files are renamed to ``*.corrupt-<ts>`` and we start empty rather
+    than silently wiping production history without a breadcrumb.
+    """
+    global _msg_map, _msg_map_loaded, _msg_map_dirty
     path = _resolve_msg_map_path()
     if path.exists():
         try:
@@ -95,38 +129,59 @@ def load_message_map() -> dict:
                 data = json.load(f)
             if isinstance(data, dict):
                 _msg_map = data
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"message_map.json unreadable, starting fresh: {e}", file=sys.stderr)
+            else:
+                raise ValueError(f"root must be object, got {type(data).__name__}")
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            bak = path.with_suffix(path.suffix + f".corrupt-{int(time.time())}")
+            try:
+                path.replace(bak)
+                print(
+                    f"message_map.json unreadable ({e}); moved to {bak.name}, starting empty",
+                    file=sys.stderr,
+                )
+            except OSError:
+                print(f"message_map.json unreadable, starting fresh: {e}", file=sys.stderr)
             _msg_map = {}
     _msg_map_loaded = True
+    _msg_map_dirty = 0
     return _msg_map
 
 
 async def _flush_message_map_locked() -> None:
-    """Caller must hold _msg_map_lock. Atomic write via .tmp+replace."""
-    path = _resolve_msg_map_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(_msg_map, f)
-    tmp.replace(path)
+    """Caller must hold _msg_map_lock. Atomic write via .tmp+fsync+replace."""
+    global _msg_map_dirty
+    _atomic_write_json(_resolve_msg_map_path(), _msg_map)
+    _msg_map_dirty = 0
 
 
-async def record_mappings(pair_name: str, pairs_iter) -> None:
-    """Record many (src_id, dest_id) pairs atomically + flush.
+async def flush_message_map() -> None:
+    """Force any dirty in-memory mappings to disk. Call at end of runs / shutdown."""
+    async with _msg_map_lock:
+        if _msg_map_dirty > 0:
+            await _flush_message_map_locked()
+
+
+async def record_mappings(pair_name: str, pairs_iter, *, force_flush: bool = False) -> None:
+    """Record many (src_id, dest_id) pairs; flush periodically or when forced.
 
     pairs_iter: iterable of (src_id, dest_id) tuples.
     Skips Nones (failed sends). Safe to call concurrently from multiple runners.
+    In-memory map is always updated immediately (live edit/delete sees new ids);
+    disk flush is coalesced every ``_MSG_MAP_FLUSH_EVERY`` adds unless force_flush.
     """
+    global _msg_map_dirty
     async with _msg_map_lock:
         bucket = _msg_map.setdefault(pair_name, {})
-        any_added = False
+        added = 0
         for src_id, dest_id in pairs_iter:
             if src_id is None or dest_id is None:
                 continue
             bucket[str(src_id)] = int(dest_id)
-            any_added = True
-        if any_added:
+            added += 1
+        if not added:
+            return
+        _msg_map_dirty += added
+        if force_flush or _msg_map_dirty >= _MSG_MAP_FLUSH_EVERY:
             await _flush_message_map_locked()
 
 
@@ -161,6 +216,7 @@ async def forget_mappings(pair_name: str, src_ids) -> None:
             if bucket.pop(str(sid), None) is not None:
                 changed = True
         if changed:
+            # Deletions always flush so a crash cannot resurrect deleted maps.
             await _flush_message_map_locked()
 
 
@@ -188,15 +244,16 @@ def load_pairs() -> dict:
 
 
 def save_pairs(cfg: dict) -> None:
-    path = _resolve_pairs_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, sort_keys=True)
-    tmp.replace(path)
+    _atomic_write_json(_resolve_pairs_path(), cfg, indent=2, sort_keys=True)
 
 
 def load_state() -> dict:
+    """Load watermarks.json.
+
+    Missing file → empty (or INITIAL_WATERMARKS_JSON seed). Corrupt/unreadable
+    file raises RuntimeError — never silent-empty, which would re-forward the
+    entire history and flood destinations with duplicates.
+    """
     path = _resolve_state_path()
     if not path.exists():
         # First boot: seed from INITIAL_WATERMARKS_JSON if provided.
@@ -206,23 +263,30 @@ def load_state() -> dict:
         if seed:
             try:
                 state = json.loads(seed)
+                if not isinstance(state, dict):
+                    raise ValueError("root must be a JSON object")
                 save_state(state)
                 print(f"Seeded watermarks from INITIAL_WATERMARKS_JSON ({len(state)} pairs)")
                 return state
-            except json.JSONDecodeError as e:
+            except (json.JSONDecodeError, ValueError) as e:
                 print(f"INITIAL_WATERMARKS_JSON is not valid JSON: {e}", file=sys.stderr)
         return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"root must be object, got {type(data).__name__}")
+        return data
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        raise RuntimeError(
+            f"watermarks.json unreadable at {path}: {e}. "
+            "Refusing empty fallback (would mass-reforward). "
+            "Restore a backup, or delete the file deliberately after confirming."
+        ) from e
 
 
 def save_state(state: dict) -> None:
-    path = _resolve_state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, sort_keys=True)
-    tmp.replace(path)
+    _atomic_write_json(_resolve_state_path(), state, indent=2, sort_keys=True)
 
 
 # Serializes the per-pair atomic save. Without this, two concurrent runners
@@ -235,7 +299,14 @@ def save_state(state: dict) -> None:
 _save_lock = asyncio.Lock()
 
 
-async def save_pair_watermark(name: str, last_msg_id: int, updated_at: int, *, allow_regression: bool = False) -> None:
+async def save_pair_watermark(
+    name: str,
+    last_msg_id: int,
+    updated_at: int,
+    *,
+    allow_regression: bool = False,
+    last_scanned_id: Optional[int] = None,
+) -> None:
     """Atomic read-modify-write of one pair's watermark. Reload latest from
     disk, update only this pair's key, write back. Preserves any updates other
     runners made to other keys between our last load and now.
@@ -246,33 +317,44 @@ async def save_pair_watermark(name: str, last_msg_id: int, updated_at: int, *, a
     set wm=Y where Y > X). Pass `allow_regression=True` to override (used by
     the repair endpoint itself when you want to roll a watermark backwards).
 
-    Extra per-pair keys (e.g. `transient_fail`) are preserved. When the new
-    watermark advances past a tracked failing msg id, that counter is cleared.
+    Extra per-pair keys (e.g. `transient_fail`, `last_scanned_id`) are preserved.
+    When the new watermark advances past a tracked failing msg id, that counter
+    is cleared.
+
+    *last_scanned_id*: highest source msg id walked by the iterator this run
+    (matching or not). Used as min_id floor for selective `type` filters so
+    non-matching history is not re-scanned every cycle. Never regresses unless
+    allow_regression=True. Changing pair.type may require a watermark repair
+    to re-scan older ids under the new filter.
     """
     async with _save_lock:
-        path = _resolve_state_path()
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                state = json.load(f)
-        else:
-            state = {}
+        # load_state() refuses corrupt files — better crash than wipe history.
+        state = load_state()
         entry = dict(state.get(name) or {})
         if not allow_regression:
             current = int(entry.get("last_msg_id", 0))
             if last_msg_id < current:
+                # Still allow scanned cursor to advance even if last_msg_id is stale.
+                if last_scanned_id is not None:
+                    cur_scan = int(entry.get("last_scanned_id", 0) or 0)
+                    if last_scanned_id > cur_scan:
+                        entry["last_scanned_id"] = int(last_scanned_id)
+                        entry["updated_at"] = updated_at
+                        state[name] = entry
+                        save_state(state)
                 return
         entry["last_msg_id"] = last_msg_id
         entry["updated_at"] = updated_at
+        if last_scanned_id is not None:
+            cur_scan = int(entry.get("last_scanned_id", 0) or 0)
+            if allow_regression or last_scanned_id >= cur_scan:
+                entry["last_scanned_id"] = int(last_scanned_id)
         # Advancing past a stuck msg clears its consecutive-fail counter.
         tf = entry.get("transient_fail")
         if isinstance(tf, dict) and int(tf.get("msg_id", 0) or 0) <= last_msg_id:
             entry.pop("transient_fail", None)
         state[name] = entry
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2, sort_keys=True)
-        tmp.replace(path)
+        save_state(state)
 
 
 async def record_transient_fail(name: str, msg_id: int) -> int:
@@ -282,12 +364,7 @@ async def record_transient_fail(name: str, msg_id: int) -> int:
     watermarks.json under pair.transient_fail so it survives restarts/cycles.
     """
     async with _save_lock:
-        path = _resolve_state_path()
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                state = json.load(f)
-        else:
-            state = {}
+        state = load_state()
         entry = dict(state.get(name) or {})
         prev = entry.get("transient_fail") if isinstance(entry.get("transient_fail"), dict) else {}
         if int(prev.get("msg_id", 0) or 0) == int(msg_id):
@@ -296,11 +373,7 @@ async def record_transient_fail(name: str, msg_id: int) -> int:
             count = 1
         entry["transient_fail"] = {"msg_id": int(msg_id), "count": count}
         state[name] = entry
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2, sort_keys=True)
-        tmp.replace(path)
+        save_state(state)
         return count
 
 
@@ -349,13 +422,8 @@ def load_retry_queue() -> dict:
 
 
 async def _flush_retry_queue_locked(data: dict) -> None:
-    """Caller must hold _retry_lock. Atomic write via .tmp+replace."""
-    path = _resolve_retry_queue_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-    tmp.replace(path)
+    """Caller must hold _retry_lock. Atomic write via .tmp+fsync+replace."""
+    _atomic_write_json(_resolve_retry_queue_path(), data, indent=2, sort_keys=True)
 
 
 async def enqueue_retry(
@@ -393,13 +461,16 @@ async def enqueue_retry(
         items = data.setdefault("items", [])
         for it in items:
             if it.get("id") == item_id:
-                # Refresh reason / size; keep attempts so history is preserved.
+                # Refresh reason / size. Revive dead/done so a re-park after
+                # watermark repair (or a new transient streak) can drain again.
                 it["reason"] = str(reason)[:500]
                 it["size_bytes"] = size
                 it["kind"] = kind
                 it["updated_at"] = now
-                if it.get("status") == "done":
+                if it.get("status") in ("done", "dead"):
                     it["status"] = "pending"
+                    it["attempts"] = 0
+                    it["last_error"] = None
                 await _flush_retry_queue_locked(data)
                 return it
         item = {
@@ -477,6 +548,9 @@ async def drain_retry_queue(
     On success: remove item + record message_map. On transient fail: bump attempts
     and leave pending (or mark dead after retry_max_attempts). On permanent fail:
     mark dead so it stops burning cycles but remains visible for manual action.
+
+    Holds the per-pair lock for each attempt so concurrent run_pair / repair
+    cannot double-post the same source message.
     """
     cfg = load_pairs()
     pairs_by_name = {_pair_key(p): p for p in cfg.get("pairs", [])}
@@ -529,45 +603,45 @@ async def drain_retry_queue(
         drop_author = bool(pair.get("drop_author", True))
         max_att = _retry_max_attempts(pair)
 
-        async with _retry_lock:
-            data = load_retry_queue()
-            cur = next((x for x in data.get("items") or [] if x.get("id") == it["id"]), None)
-            if not cur or cur.get("status") not in (None, "pending"):
-                skipped += 1
-                continue
-            cur["attempts"] = int(cur.get("attempts") or 0) + 1
-            cur["last_attempt_at"] = int(time.time())
-            cur["updated_at"] = cur["last_attempt_at"]
-            attempt_n = cur["attempts"]
-            await _flush_retry_queue_locked(data)
+        # Serialize with run_pair / repair for this pair name.
+        pair_lock = _get_pair_lock(name)
+        if pair_lock.locked():
+            print(f"[retry-queue] {name} busy — deferring src#{src_id}", flush=True)
+            skipped += 1
+            results.append({"id": it["id"], "src_id": src_id, "status": "deferred",
+                            "error": "pair locked"})
+            continue
 
-        print(f"[retry-queue] {name} src#{src_id} attempt {attempt_n}", flush=True)
-        try:
-            msgs = await dl.client.get_messages(source, ids=[src_id])
-            msg = msgs[0] if msgs else None
-            if msg is None:
-                raise RuntimeError("source message missing (deleted?)")
+        async with pair_lock:
+            async with _retry_lock:
+                data = load_retry_queue()
+                cur = next((x for x in data.get("items") or [] if x.get("id") == it["id"]), None)
+                if not cur or cur.get("status") not in (None, "pending"):
+                    skipped += 1
+                    continue
+                cur["attempts"] = int(cur.get("attempts") or 0) + 1
+                cur["last_attempt_at"] = int(time.time())
+                cur["updated_at"] = cur["last_attempt_at"]
+                attempt_n = cur["attempts"]
+                await _flush_retry_queue_locked(data)
 
-            # Apply per-pair text replacements if any.
-            override = None
-            replacements = pair.get("replacements") or []
-            if replacements and msg.message:
-                transformed = apply_replacements(msg.message, replacements)
-                if transformed != msg.message:
-                    override = transformed
+            print(f"[retry-queue] {name} src#{src_id} attempt {attempt_n}", flush=True)
+            try:
+                msgs = await dl.client.get_messages(source, ids=[src_id])
+                msg = msgs[0] if msgs else None
+                if msg is None:
+                    raise RuntimeError("source message missing (deleted?)")
 
-            src_protected = await dl.is_source_protected(source)
-            sent = None
-            if not src_protected and override is None:
-                forwarded = await dl.forward_batch(
-                    source, dest, [msg],
-                    drop_author=drop_author, top_msg_id=dest_topic,
-                )
-                sent = forwarded[0] if forwarded else None
-            else:
-                # Protected sources, or caption rewrite needed → copy path.
-                # When only replacements force copy on unprotected sources, still
-                # prefer native+edit for speed; match main-path behaviour.
+                # Apply per-pair text replacements if any.
+                override = None
+                replacements = pair.get("replacements") or []
+                if replacements and msg.message:
+                    transformed = apply_replacements(msg.message, replacements)
+                    if transformed != msg.message:
+                        override = transformed
+
+                src_protected = await dl.is_source_protected(source)
+                sent = None
                 if not src_protected:
                     forwarded = await dl.forward_batch(
                         source, dest, [msg],
@@ -588,51 +662,51 @@ async def drain_retry_queue(
                         msg, dest, dest_topic=dest_topic, text_override=override,
                     )
 
-            if sent is None:
-                raise TimeoutError("forward/copy returned no result")
+                if sent is None:
+                    raise TimeoutError("forward/copy returned no result")
 
-            dest_msg_id = getattr(sent, "id", None)
-            if dest_msg_id is not None:
-                await record_mappings(name, [(src_id, dest_msg_id)])
+                dest_msg_id = getattr(sent, "id", None)
+                if dest_msg_id is not None:
+                    await record_mappings(name, [(src_id, dest_msg_id)])
 
-            async with _retry_lock:
-                data = load_retry_queue()
-                data["items"] = [
-                    x for x in data.get("items") or [] if x.get("id") != it["id"]
-                ]
-                await _flush_retry_queue_locked(data)
-
-            ok += 1
-            results.append({"id": it["id"], "src_id": src_id, "status": "ok",
-                            "dest_id": dest_msg_id})
-            print(f"[retry-queue] ✓ {name} src#{src_id} → dest#{dest_msg_id}", flush=True)
-
-        except Exception as e:
-            fail += 1
-            err_s = f"{type(e).__name__}: {e}"
-            transient = is_transient_error(e) or isinstance(e, TimeoutError)
-            async with _retry_lock:
-                data = load_retry_queue()
-                cur = next((x for x in data.get("items") or [] if x.get("id") == it["id"]), None)
-                if cur:
-                    cur["last_error"] = err_s[:500]
-                    cur["updated_at"] = int(time.time())
-                    if (not transient) or (max_att > 0 and int(cur.get("attempts") or 0) >= max_att):
-                        cur["status"] = "dead"
-                        results.append({"id": it["id"], "src_id": src_id, "status": "dead",
-                                        "error": err_s})
-                        print(
-                            f"[retry-queue] ✗ {name} src#{src_id} marked dead: {err_s}",
-                            file=sys.stderr, flush=True,
-                        )
-                    else:
-                        results.append({"id": it["id"], "src_id": src_id, "status": "pending",
-                                        "error": err_s})
-                        print(
-                            f"[retry-queue] ⏳ {name} src#{src_id} will retry later: {err_s}",
-                            flush=True,
-                        )
+                async with _retry_lock:
+                    data = load_retry_queue()
+                    data["items"] = [
+                        x for x in data.get("items") or [] if x.get("id") != it["id"]
+                    ]
                     await _flush_retry_queue_locked(data)
+
+                ok += 1
+                results.append({"id": it["id"], "src_id": src_id, "status": "ok",
+                                "dest_id": dest_msg_id})
+                print(f"[retry-queue] ✓ {name} src#{src_id} → dest#{dest_msg_id}", flush=True)
+
+            except Exception as e:
+                fail += 1
+                err_s = f"{type(e).__name__}: {e}"
+                transient = is_transient_error(e) or isinstance(e, TimeoutError)
+                async with _retry_lock:
+                    data = load_retry_queue()
+                    cur = next((x for x in data.get("items") or [] if x.get("id") == it["id"]), None)
+                    if cur:
+                        cur["last_error"] = err_s[:500]
+                        cur["updated_at"] = int(time.time())
+                        if (not transient) or (max_att > 0 and int(cur.get("attempts") or 0) >= max_att):
+                            cur["status"] = "dead"
+                            results.append({"id": it["id"], "src_id": src_id, "status": "dead",
+                                            "error": err_s})
+                            print(
+                                f"[retry-queue] ✗ {name} src#{src_id} marked dead: {err_s}",
+                                file=sys.stderr, flush=True,
+                            )
+                        else:
+                            results.append({"id": it["id"], "src_id": src_id, "status": "pending",
+                                            "error": err_s})
+                            print(
+                                f"[retry-queue] ⏳ {name} src#{src_id} will retry later: {err_s}",
+                                flush=True,
+                            )
+                        await _flush_retry_queue_locked(data)
 
         if job:
             job.update({"done": idx + 1, "ok": ok, "fail": fail})
@@ -779,6 +853,11 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
     replacements = pair.get("replacements") or []
 
     watermark = int(state.get(name, {}).get("last_msg_id", 0))
+    # last_scanned_id floors the iterator for selective type filters so non-
+    # matching history is not re-walked every cycle. Floor is max of both
+    # cursors (scanned never behind forwarded on a healthy pair).
+    last_scanned = int(state.get(name, {}).get("last_scanned_id", 0) or 0)
+    scan_from = max(watermark, last_scanned)
 
     # Bail early if Telegram is unreachable — leave watermark untouched so the
     # next scheduler cycle (after reconnect backoff) retries the same range.
@@ -813,13 +892,17 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
         topic_note += f" src_topic={source_topic}"
     if dest_topic:
         topic_note += f" dst_topic={dest_topic}"
-    print(f"[{name}] source={source} dest={dest} type={ftype}{topic_note} since=#{watermark} mode={mode}")
+    scan_note = f" scanned≥#{last_scanned}" if last_scanned > watermark else ""
+    print(
+        f"[{name}] source={source} dest={dest} type={ftype}{topic_note} "
+        f"since=#{scan_from} (wm=#{watermark}{scan_note}) mode={mode}"
+    )
 
     # Topic-aware iteration. reply_to=topic_id calls messages.getReplies and
     # returns only that topic's messages. Topic id=1 ("General") doesn't carry
     # reply_to, so server-side filter doesn't work — fall back to whole-chat
     # iteration in that case (handled by caller setting source_topic to null).
-    iter_kwargs = {"min_id": watermark}
+    iter_kwargs = {"min_id": scan_from}
     if source_topic and source_topic > 1:
         iter_kwargs["reply_to"] = source_topic
     # When ftype="all" every message matches, so cap the fetch at max_per_run
@@ -831,6 +914,20 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
 
     ok = fail = 0
     last_ok_id = watermark
+    highest_seen_id = scan_from  # advances for every walked msg (match or not)
+
+    async def _persist_wm(*, scanned: Optional[int] = None) -> None:
+        """Write last_ok_id (+ optional scanned cursor) to disk."""
+        now = int(time.time())
+        sid = highest_seen_id if scanned is None else scanned
+        state[name] = {
+            "last_msg_id": last_ok_id,
+            "updated_at": now,
+            "last_scanned_id": sid,
+        }
+        await save_pair_watermark(
+            name, last_ok_id, now, last_scanned_id=sid,
+        )
 
     if use_native:
         # Native server-side forward, STREAMING in batches of up to 100.
@@ -900,10 +997,17 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                 try:
                     return await _do_forward(msgs_batch), None
                 except FloodWaitError as fw:
+                    # Honour the wait, then one more try. A second FloodWait is
+                    # still rate-limit, NOT a permanent RPC failure — abort the
+                    # run so watermark stays put (never skip+advance on FloodWait).
                     print(f"[{name}] flood wait {fw.seconds}s")
                     await asyncio.sleep(fw.seconds + 1)
                     try:
                         return await _do_forward(msgs_batch), None
+                    except FloodWaitError as fw2:
+                        print(f"[{name}] flood wait again {fw2.seconds}s — aborting run")
+                        await asyncio.sleep(min(fw2.seconds + 1, 120))
+                        return None, fw2
                     except Exception as e:
                         return None, e
                 except Exception as e:
@@ -913,6 +1017,15 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             if err is not None:
                 if len(msgs_batch) == 1:
                     m = msgs_batch[0]
+                    # FloodWait is never permanent — abort without advancing.
+                    if isinstance(err, FloodWaitError):
+                        fail += 1
+                        print(
+                            f"[{name}] msg #{m.id} FloodWait after retry — "
+                            f"aborting (watermark stays at #{last_ok_id})",
+                            file=sys.stderr,
+                        )
+                        raise TransientNetworkAbort(m.id, err)
                     if is_transient_error(err):
                         fail += 1
                         skip_after = _transient_skip_after(pair)
@@ -930,9 +1043,7 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                                 reason=f"native transient x{count}: {type(err).__name__}: {err}",
                             )
                             last_ok_id = max(last_ok_id, m.id)
-                            now = int(time.time())
-                            state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
-                            await save_pair_watermark(name, last_ok_id, now)
+                            await _persist_wm()
                             i += 1
                             return False
                         print(
@@ -947,9 +1058,7 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                     fail += 1
                     # Advance past the single bad message so we don't loop forever.
                     last_ok_id = max(last_ok_id, m.id)
-                    now = int(time.time())
-                    state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
-                    await save_pair_watermark(name, last_ok_id, now)
+                    await _persist_wm()
                     i += 1
                     return False
                 mid = len(msgs_batch) // 2
@@ -966,25 +1075,48 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             forwarded_list = forwarded if isinstance(forwarded, (list, tuple)) else [forwarded]
             mappings = []
             edits = []
+            missing = []  # src msgs whose dest id we could not confirm
+            # Watermark may only advance through a contiguous confirmed prefix.
+            # Successes AFTER a None gap must not pull last_ok_id past the hole
+            # (would permanently skip the unmatched src ids on next cycle).
+            gap_seen = False
             for m, f in zip(msgs_batch, forwarded_list):
                 if f is not None:
                     ok += 1
-                    last_ok_id = m.id
                     dest_id = getattr(f, "id", None)
                     mappings.append((m.id, dest_id))
+                    if not gap_seen:
+                        last_ok_id = m.id
                     if replacements and m.message and dest_id is not None:
                         new_text = apply_replacements(m.message, replacements)
                         if new_text != m.message:
                             edits.append((m.id, dest_id, new_text))
                 else:
                     fail += 1
+                    gap_seen = True
+                    missing.append(m)
             if mappings:
                 await record_mappings(name, mappings)
             await _apply_edits(edits)
+            if missing:
+                for m in missing:
+                    print(
+                        f"[{name}] msg #{m.id} forward returned no dest id — "
+                        f"will retry (watermark stays at #{last_ok_id})",
+                        file=sys.stderr,
+                    )
+                    await enqueue_retry(
+                        pair, m,
+                        reason="native forward returned no dest id",
+                    )
+                # Whole batch unconfirmed → abort so the next cycle retries the
+                # same range without claiming progress.
+                if not mappings:
+                    raise TransientNetworkAbort(missing[0].id, RuntimeError(
+                        f"{len(missing)} msg(s) returned no dest id"
+                    ))
             i += len(msgs_batch)
-            now = int(time.time())
-            state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
-            await save_pair_watermark(name, last_ok_id, now)
+            await _persist_wm()
             if job:
                 job.update({"done": i, "ok": ok, "fail": fail, "last_id": last_ok_id, "status": "running"})
             print(f"[{name}] progress {i} (ok={ok} fail={fail} last_id=#{last_ok_id})")
@@ -1001,11 +1133,22 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
         aborted_transient = False
         try:
             async for m in dl.client.iter_messages(source, reverse=True, **iter_kwargs):
+                # Track every walked id so selective type filters can skip
+                # re-scanning non-matching history next cycle.
+                if m.id > highest_seen_id:
+                    highest_seen_id = m.id
                 if job and job.get("cancel"):
                     print(f"[{name}] cancelled during scan at i={i}")
                     job["status"] = "cancelled"
                     break
                 if not _matches_type(m, ftype, dl):
+                    continue
+                # Already mirrored (e.g. partial-batch gap recovery) — advance
+                # past without re-forwarding.
+                if lookup_dest_id(name, m.id) is not None:
+                    if m.id > last_ok_id:
+                        last_ok_id = m.id
+                        await _persist_wm()
                     continue
                 batch.append(m)
                 if len(batch) >= BATCH:
@@ -1027,14 +1170,20 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             if job and job.get("status") == "running":
                 job["status"] = "error"
                 job["error"] = str(abort)
+        # Persist scanned cursor even when nothing matched (type filter).
+        if highest_seen_id > scan_from or last_ok_id != watermark:
+            await _persist_wm()
+        await flush_message_map()
         if job and job["status"] == "running":
             job["status"] = "finished"
         print(f"[{name}] done: forwarded={ok} failed={fail} new_watermark=#{last_ok_id}"
+              f" scanned=#{highest_seen_id}"
               f"{' (aborted_transient)' if aborted_transient else ''}")
         return {
             "forwarded": ok,
             "failed": fail,
             "last_id": last_ok_id,
+            "last_scanned_id": highest_seen_id,
             **({"aborted_transient": True} if aborted_transient else {}),
         }
 
@@ -1046,12 +1195,15 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
     max_size_bytes = int(pair.get("max_file_size_mb", 0) or 0) * 1024 * 1024
     concurrency = _copy_concurrency(pair, dl)
     iter_kwargs.pop("limit", None)  # stream; cap via max_per_run below
-    (BASE_DIR / "temp").mkdir(exist_ok=True)
+    # Per-run temp subdir so concurrent pairs / oneshot don't wipe each other's
+    # in-flight downloads (shared temp/ + rmtree was a cross-job data race).
+    run_temp_dir = BASE_DIR / "temp" / f"{name}-{uuid.uuid4().hex[:10]}"
+    run_temp_dir.mkdir(parents=True, exist_ok=True)
 
     if job:
         job.update({"status": "running"})
 
-    print(f"[{name}] copy pipeline concurrency={concurrency}")
+    print(f"[{name}] copy pipeline concurrency={concurrency} temp={run_temp_dir.name}")
 
     download_sem = asyncio.Semaphore(concurrency)
     large_sem = asyncio.Semaphore(1)  # at most one >20MB download at a time
@@ -1092,9 +1244,9 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             async with download_sem:
                 if use_large:
                     async with large_sem:
-                        payload = await dl._download_copy_media(m)
+                        payload = await dl._download_copy_media(m, temp_dir=run_temp_dir)
                 else:
-                    payload = await dl._download_copy_media(m)
+                    payload = await dl._download_copy_media(m, temp_dir=run_temp_dir)
             ready[slot] = {
                 "msg": m, "payload": payload, "override": override, "error": None,
             }
@@ -1105,9 +1257,11 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
         ready_event.set()
 
     async def _producer():
-        nonlocal next_slot, skipped_oversize, producer_done, cancelled
+        nonlocal next_slot, skipped_oversize, producer_done, cancelled, highest_seen_id
         try:
             async for m in dl.client.iter_messages(source, reverse=True, **iter_kwargs):
+                if m.id > highest_seen_id:
+                    highest_seen_id = m.id
                 if job and job.get("cancel"):
                     cancelled = True
                     print(f"[{name}] cancelled during stream at slot={next_slot}")
@@ -1116,14 +1270,39 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                     break
                 if not _matches_type(m, ftype, dl):
                     continue
+                if lookup_dest_id(name, m.id) is not None:
+                    # Already on dest (map hit). Emit a synthetic ordered slot so
+                    # the uploader advances watermark past this id without I/O.
+                    slot = next_slot
+                    next_slot += 1
+                    ready[slot] = {
+                        "msg": m, "payload": None, "override": None,
+                        "error": None, "already_mapped": True,
+                    }
+                    ready_event.set()
+                    if max_per_run and next_slot >= max_per_run:
+                        break
+                    continue
                 if max_size_bytes > 0:
                     sz = _msg_media_size_bytes(m)
                     if sz > max_size_bytes:
+                        # Still allocate a slot so the ordered uploader can advance
+                        # the watermark past this message (otherwise a single oversize
+                        # mid-stream freezes last_ok_id forever).
                         skipped_oversize += 1
                         print(
                             f"[{name}] skip #{m.id}: media {sz // (1024*1024)} MB "
                             f"> cap {pair.get('max_file_size_mb')} MB"
                         )
+                        slot = next_slot
+                        next_slot += 1
+                        ready[slot] = {
+                            "msg": m, "payload": None, "override": None,
+                            "error": None, "skip_oversize": True,
+                        }
+                        ready_event.set()
+                        if max_per_run and next_slot >= max_per_run:
+                            break
                         continue
                 if max_per_run and next_slot >= max_per_run:
                     break
@@ -1151,8 +1330,8 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             ready_event.set()
             if skipped_oversize:
                 print(
-                    f"[{name}] filter: skipped {skipped_oversize} oversize msg(s) — "
-                    f"they'll be re-evaluated next run if cap is raised"
+                    f"[{name}] filter: skipped {skipped_oversize} oversize msg(s) "
+                    f"(watermark advanced; raise max_file_size_mb + repair to recover)"
                 )
 
     async def _uploader():
@@ -1190,6 +1369,30 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             err = item["error"]
             processed += 1
 
+            if item.get("skip_oversize"):
+                # Intentional permanent skip: advance watermark so the stream
+                # is not permanently pinned to this large file.
+                last_ok_id = max(last_ok_id, m.id)
+                await _persist_wm()
+                if job:
+                    job.update({
+                        "done": processed, "ok": ok, "fail": fail,
+                        "last_id": last_ok_id, "total": max(next_slot, processed),
+                    })
+                next_upload_idx += 1
+                continue
+
+            if item.get("already_mapped"):
+                last_ok_id = max(last_ok_id, m.id)
+                await _persist_wm()
+                if job:
+                    job.update({
+                        "done": processed, "ok": ok, "fail": fail,
+                        "last_id": last_ok_id, "total": max(next_slot, processed),
+                    })
+                next_upload_idx += 1
+                continue
+
             async def _handle_transient(reason: BaseException | str) -> bool:
                 """Count consecutive transient fails on this msg.
 
@@ -1215,9 +1418,7 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                         reason=f"copy transient x{count}: {reason}",
                     )
                     last_ok_id = max(last_ok_id, m.id)
-                    now = int(time.time())
-                    state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
-                    await save_pair_watermark(name, last_ok_id, now)
+                    await _persist_wm()
                     return True
                 aborted_transient = True
                 print(
@@ -1247,9 +1448,7 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                     # so a single bad media item cannot stall the pair forever.
                     fail += 1
                     last_ok_id = max(last_ok_id, m.id)
-                    now = int(time.time())
-                    state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
-                    await save_pair_watermark(name, last_ok_id, now)
+                    await _persist_wm()
             elif payload is None:
                 # download gave up after internal retries (timeouts etc.) — treat
                 # as transient so the next cycle re-tries this message (until
@@ -1288,16 +1487,12 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                         # Permanent upload error: skip + advance watermark.
                         fail += 1
                         last_ok_id = max(last_ok_id, m.id)
-                        now = int(time.time())
-                        state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
-                        await save_pair_watermark(name, last_ok_id, now)
+                        await _persist_wm()
                         sent = "skipped_permanent"
                 if sent and sent != "skipped_permanent":
                     ok += 1
                     last_ok_id = m.id
-                    now = int(time.time())
-                    state[name] = {"last_msg_id": last_ok_id, "updated_at": now}
-                    await save_pair_watermark(name, last_ok_id, now)
+                    await _persist_wm()
                     dest_msg_id = getattr(sent, "id", None)
                     if dest_msg_id is not None:
                         await record_mappings(name, [(m.id, dest_msg_id)])
@@ -1343,9 +1538,10 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             if isinstance(payload, dict) and payload.get("kind") == "media":
                 dl._unlink_quiet(payload.get("temp_path"))
         ready.clear()
+        # Only this run's temp subdir — never wipe shared temp/ (other pairs /
+        # oneshot / CLI may be downloading into sibling dirs).
         try:
-            import shutil
-            shutil.rmtree(BASE_DIR / "temp", ignore_errors=True)
+            shutil.rmtree(run_temp_dir, ignore_errors=True)
         except Exception:
             pass
 
@@ -1358,15 +1554,21 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
         elif job.get("status") == "running":
             job["status"] = "finished"
 
+    if highest_seen_id > scan_from or last_ok_id != watermark:
+        await _persist_wm()
+    await flush_message_map()
+
     if next_slot == 0 and not aborted_transient:
         print(f"[{name}] no new messages")
     print(
         f"[{name}] done: forwarded={ok} failed={fail} new_watermark=#{last_ok_id}"
+        f" scanned=#{highest_seen_id}"
         f"{' (aborted_transient)' if aborted_transient else ''}"
         f"{' (cancelled)' if cancelled and not aborted_transient else ''}"
     )
     return {
         "forwarded": ok, "failed": fail, "last_id": last_ok_id,
+        "last_scanned_id": highest_seen_id,
         **({"cancelled": True} if cancelled and not aborted_transient else {}),
         **({"aborted_transient": True} if aborted_transient else {}),
     }
