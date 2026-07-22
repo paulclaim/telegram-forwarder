@@ -419,6 +419,9 @@ class TelegramDownloader:
         temp_path = None
         # Up to 3 attempts covering FloodWait and transient network/timeouts.
         # Permanent errors re-raise immediately so the caller can skip + advance.
+        # FloodWait exhaustion also re-raises: callers must abort without
+        # skip+advance / park (FloodWait is rate-limit, not a broken message).
+        last_flood: Optional[FloodWaitError] = None
         for attempt in range(3):
             try:
                 temp_path = await asyncio.wait_for(
@@ -427,6 +430,7 @@ class TelegramDownloader:
                 )
                 break
             except FloodWaitError as fw:
+                last_flood = fw
                 print(f"\n  ⏳ Download flood wait {fw.seconds}s (attempt {attempt + 1}/3)...")
                 await asyncio.sleep(fw.seconds + 1)
             except Exception as e:
@@ -447,7 +451,14 @@ class TelegramDownloader:
                     return None
                 raise
         else:
+            # Only FloodWait path uses for-else (loop never broke). Re-raise so
+            # automate aborts without parking the still-rate-limited message.
             self._unlink_quiet(safe_temp)
+            if last_flood is not None:
+                print(
+                    f"\n  ⏱ Download msg #{msg.id} FloodWait exhausted after 3 waits — aborting"
+                )
+                raise last_flood
             return None
         if not temp_path:
             self._unlink_quiet(safe_temp)
@@ -537,6 +548,7 @@ class TelegramDownloader:
                 pass
             timeout = self._transfer_timeout(size)
             last_err = None
+            last_flood: Optional[FloodWaitError] = None
             for attempt in range(3):
                 try:
                     return await asyncio.wait_for(
@@ -545,6 +557,7 @@ class TelegramDownloader:
                     )
                 except FloodWaitError as fw:
                     last_err = fw
+                    last_flood = fw
                     print(f"\n  ⏳ Upload flood wait {fw.seconds}s (attempt {attempt + 1}/3)...")
                     await asyncio.sleep(fw.seconds + 1)
                 except Exception as e:
@@ -563,6 +576,13 @@ class TelegramDownloader:
                         )
                         return None
                     raise
+            # FloodWait-only exhaustion: re-raise so callers abort without
+            # skip+advance / park (still rate-limited, not a broken message).
+            if last_flood is not None and isinstance(last_err, FloodWaitError):
+                print(
+                    f"\n  ⏱ Upload msg #{msg.id} FloodWait exhausted after 3 waits — aborting"
+                )
+                raise last_flood
             print(f"\n  ✗ Upload msg #{msg.id}: gave up after 3 attempts ({last_err})")
             return None
         finally:
@@ -575,22 +595,21 @@ class TelegramDownloader:
         # text_override: replaces msg.message verbatim (drops entities since
         # offsets would be wrong). Used by automate's per-pair replacements.
         # temp_dir: optional per-run download directory (see _download_copy_media).
-        # Returns the sent Message on success, None on failure.
+        # Returns the sent Message on success, None on soft failure (transient
+        # give-up after internal retries). Permanent RPC/business errors and
+        # FloodWait exhaustion re-raise so callers can skip-or-abort correctly
+        # instead of treating every failure as a retriable network blip.
         #
         # Download and upload are split so automate's copy pipeline can
         # download-ahead; this method composes them for sequential callers.
         # FloodWait is handled inside _download_copy_media / _send_copy_payload.
-        try:
-            payload = await self._download_copy_media(msg, temp_dir=temp_dir)
-            if payload is None:
-                return None
-            return await self._send_copy_payload(
-                msg, dest_id, payload,
-                dest_topic=dest_topic, text_override=text_override,
-            )
-        except Exception as e:
-            print(f"\n  ✗ Failed msg #{msg.id}: {e}")
+        payload = await self._download_copy_media(msg, temp_dir=temp_dir)
+        if payload is None:
             return None
+        return await self._send_copy_payload(
+            msg, dest_id, payload,
+            dest_topic=dest_topic, text_override=text_override,
+        )
 
     async def forward_batch(self, source, dest, msgs, *, drop_author: bool = True,
                             top_msg_id: int | None = None):
@@ -603,8 +622,9 @@ class TelegramDownloader:
 
         Alignment strategy (in order):
           1. random_id → UpdateNew* message / UpdateMessageID
-          2. leftover new messages in Updates order (fallback when random_id
-             is missing on channel messages)
+          2. single leftover UpdateNew* only when exactly one None slot remains
+             (never multi-slot order-fill — that can cross-map src→dest when
+             channel echoes omit random_id and order diverges)
         """
         import random
         from telethon.tl.types import UpdateMessageID
@@ -654,15 +674,14 @@ class TelegramDownloader:
             else:
                 out.append(None)
 
-        # Fallback: fill remaining Nones with unused new messages in order.
-        # Telegram usually echoes forwards in the same order as input ids.
-        if any(x is None for x in out) and ordered_new:
+        # Safe single-slot fallback only. Multi-None order-fill can attach the
+        # wrong dest id when random_id is missing and Updates order diverges
+        # from input order — better leave None (retry/gap) than corrupt map.
+        none_idxs = [i for i, x in enumerate(out) if x is None]
+        if len(none_idxs) == 1:
             leftover = [m for m in ordered_new if id(m) not in used_msgs]
-            li = 0
-            for i, item in enumerate(out):
-                if item is None and li < len(leftover):
-                    out[i] = leftover[li]
-                    li += 1
+            if len(leftover) == 1:
+                out[none_idxs[0]] = leftover[0]
 
         return out
 
@@ -736,7 +755,11 @@ class TelegramDownloader:
             run_temp.mkdir(parents=True, exist_ok=True)
             try:
                 for i, msg in enumerate(messages_to_send, 1):
-                    success = await self._copy_message_to(msg, dest_id, temp_dir=run_temp)
+                    try:
+                        success = await self._copy_message_to(msg, dest_id, temp_dir=run_temp)
+                    except Exception as e:
+                        print(f"\n  ✗ copy msg #{msg.id}: {e}")
+                        success = None
                     if success:
                         stats["forwarded"] += 1
                     else:
@@ -832,7 +855,11 @@ class TelegramDownloader:
             run_temp.mkdir(parents=True, exist_ok=True)
             try:
                 for i, msg in enumerate(messages_to_forward, 1):
-                    ok = await self._copy_message_to(msg, dest_id, temp_dir=run_temp)
+                    try:
+                        ok = await self._copy_message_to(msg, dest_id, temp_dir=run_temp)
+                    except Exception as e:
+                        print(f"\n  ✗ copy msg #{msg.id}: {e}")
+                        ok = None
                     if ok:
                         stats["forwarded"] += 1
                     else:

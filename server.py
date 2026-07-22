@@ -478,7 +478,9 @@ async def api_pair_repair(name: str):
                             ok += 1
                             dest_id = getattr(sent, "id", None)
                             if dest_id is not None:
-                                await record_mappings(name, [(m.id, dest_id)])
+                                await record_mappings(
+                                    name, [(m.id, dest_id)], force_flush=True,
+                                )
                         else:
                             fail += 1
                     except Exception as e:
@@ -518,7 +520,7 @@ async def api_pair_repair(name: str):
                         else:
                             fail += 1
                     if mappings:
-                        await record_mappings(name, mappings)
+                        await record_mappings(name, mappings, force_flush=True)
                 except Exception as e:
                     print(f"[repair {name}] batch failed: {e}")
                     fail += len(batch)
@@ -595,22 +597,42 @@ async def api_multi_forward():
 
 @app.route("/api/pairs/<name>/watermark", methods=["POST"])
 async def api_set_watermark(name: str):
-    """Manually set a pair's watermark. Body: {"last_msg_id": int}.
-    Used to repair clobbered watermarks (see 2026-05-19 race) or to skip ahead.
+    """Manually set a pair's watermark.
+
+    Body: ``{"last_msg_id": int, "last_scanned_id"?: int}``.
+
+    Used to repair clobbered watermarks or to skip ahead / re-forward a range.
+    When rolling *last_msg_id* backwards without an explicit *last_scanned_id*,
+    ``save_pair_watermark(..., allow_regression=True)`` also pulls the scanned
+    floor down to the new watermark so ``scan_from = max(wm, scanned)`` actually
+    re-iterates the repaired range.
 
     Refuses while the pair is mid-run so an in-flight runner cannot race the
     repaired value (or re-forward against a stale min_id snapshot).
     """
     body = await request.get_json(force=True)
     wm = int(body.get("last_msg_id", 0))
+    scanned_raw = body.get("last_scanned_id", None)
+    scanned = int(scanned_raw) if scanned_raw is not None else None
     pair_lock = _get_pair_lock(name)
     if pair_lock.locked():
         return jsonify({"error": f"pair '{name}' is running — pause/wait, then set watermark"}), 409
     async with pair_lock:
         # Manual repair allowed to roll backwards (e.g., to re-forward a range).
-        await save_pair_watermark(name, wm, int(time.time()), allow_regression=True)
-    _log_event({"kind": "watermark_set", "pair": name, "wm": wm})
-    return jsonify({"ok": True, "pair": name, "watermark": wm})
+        # Omitting last_scanned_id → save_pair_watermark clamps scanned to wm.
+        await save_pair_watermark(
+            name, wm, int(time.time()),
+            allow_regression=True,
+            last_scanned_id=scanned,
+        )
+    _log_event({
+        "kind": "watermark_set", "pair": name, "wm": wm,
+        **({"last_scanned_id": scanned} if scanned is not None else {}),
+    })
+    return jsonify({
+        "ok": True, "pair": name, "watermark": wm,
+        **({"last_scanned_id": scanned if scanned is not None else wm}),
+    })
 
 
 @app.route("/api/retry-queue")
@@ -983,12 +1005,16 @@ async def api_forward_once():
                     if job.get("cancel"):
                         job["status"] = "cancelled"
                         break
-                    success = await _dl._copy_message_to(
-                        m, dest, dest_topic=dest_topic, temp_dir=run_temp,
-                    )
-                    if success:
-                        ok += 1
-                    else:
+                    try:
+                        success = await _dl._copy_message_to(
+                            m, dest, dest_topic=dest_topic, temp_dir=run_temp,
+                        )
+                        if success:
+                            ok += 1
+                        else:
+                            fail += 1
+                    except Exception as e:
+                        print(f"[oneshot {source}->{dest}] copy #{m.id} failed: {e}", file=sys.stderr)
                         fail += 1
                     job.update({"done": i, "ok": ok, "fail": fail, "last_id": m.id})
                     await asyncio.sleep(delay)
