@@ -50,11 +50,15 @@ def _resolve_retry_queue_path() -> Path:
     return Path(os.environ.get("RETRY_QUEUE_PATH", str(DEFAULT_RETRY_QUEUE)))
 
 
-def _atomic_write_json(path: Path, data, *, indent=None, sort_keys: bool = False) -> None:
+def _atomic_write_json(
+    path: Path, data, *, indent=None, sort_keys: bool = False, fsync: bool = True
+) -> None:
     """Write JSON via temp file + fsync + os.replace (crash-safe).
 
     Unique temp suffix avoids leftover collisions across processes; replace is
     atomic on the same filesystem so readers never see a half-written file.
+    *fsync=False* skips the durability barrier — only for data whose loss on
+    power-cut is acceptable (e.g. the run-log ring buffer).
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -63,7 +67,8 @@ def _atomic_write_json(path: Path, data, *, indent=None, sort_keys: bool = False
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=indent, sort_keys=sort_keys)
             f.flush()
-            os.fsync(f.fileno())
+            if fsync:
+                os.fsync(f.fileno())
         os.replace(tmp, path)
     except Exception:
         try:
@@ -114,6 +119,16 @@ _msg_map_loaded = False
 _msg_map_dirty: int = 0
 _MSG_MAP_FLUSH_EVERY = 25
 
+# Optional per-pair cap on message_map entries (0 = unlimited, current default).
+# Live edit/delete only matters for recent messages in practice; capping stops
+# the map JSON from growing (and being rewritten) forever on long-lived pairs.
+# Oldest src ids are pruned first. Set via env MSG_MAP_MAX_PER_PAIR.
+def _msg_map_cap() -> int:
+    try:
+        return max(0, int(os.environ.get("MSG_MAP_MAX_PER_PAIR", "0") or 0))
+    except (TypeError, ValueError):
+        return 0
+
 
 def load_message_map() -> dict:
     """Read from disk into in-memory _msg_map. Idempotent.
@@ -148,9 +163,15 @@ def load_message_map() -> dict:
 
 
 async def _flush_message_map_locked() -> None:
-    """Caller must hold _msg_map_lock. Atomic write via .tmp+fsync+replace."""
+    """Caller must hold _msg_map_lock. Atomic write via .tmp+fsync+replace.
+
+    Serialization + fsync run in a worker thread so a multi-MB map on slow
+    flash (OpenWrt) doesn't stall the event loop (web UI + Telethon pings).
+    Mutators all take _msg_map_lock, which we hold, so the dict cannot change
+    under the serializer.
+    """
     global _msg_map_dirty
-    _atomic_write_json(_resolve_msg_map_path(), _msg_map)
+    await asyncio.to_thread(_atomic_write_json, _resolve_msg_map_path(), _msg_map)
     _msg_map_dirty = 0
 
 
@@ -171,6 +192,12 @@ async def record_mappings(pair_name: str, pairs_iter, *, force_flush: bool = Fal
     """
     global _msg_map_dirty
     async with _msg_map_lock:
+        # Standalone automate.py never went through server startup — load the
+        # on-disk map before first write, otherwise the first flush would
+        # overwrite the file with only this run's entries (losing all history
+        # and the duplicate-forward protection that depends on it).
+        if not _msg_map_loaded:
+            load_message_map()
         bucket = _msg_map.setdefault(pair_name, {})
         added = 0
         for src_id, dest_id in pairs_iter:
@@ -181,6 +208,13 @@ async def record_mappings(pair_name: str, pairs_iter, *, force_flush: bool = Fal
         if not added:
             return
         _msg_map_dirty += added
+        cap = _msg_map_cap()
+        if cap > 0 and len(bucket) > cap + 50:
+            # Prune oldest src ids down to the cap (slack of 50 amortizes the
+            # sort so we don't re-sort on every single add above the cap).
+            for k in sorted(bucket.keys(), key=int)[: len(bucket) - cap]:
+                bucket.pop(k, None)
+            _msg_map_dirty += 1
         if force_flush or _msg_map_dirty >= _MSG_MAP_FLUSH_EVERY:
             await _flush_message_map_locked()
 
@@ -208,6 +242,8 @@ async def forget_mappings(pair_name: str, src_ids) -> None:
     """Remove recorded entries (called after delete-propagation runs).
     Stops the map from growing forever for ephemeral source messages."""
     async with _msg_map_lock:
+        if not _msg_map_loaded:
+            load_message_map()
         bucket = _msg_map.get(pair_name)
         if not bucket:
             return
@@ -346,7 +382,7 @@ async def save_pair_watermark(
                         entry["last_scanned_id"] = int(last_scanned_id)
                         entry["updated_at"] = updated_at
                         state[name] = entry
-                        save_state(state)
+                        await asyncio.to_thread(save_state, state)
                 return
         entry["last_msg_id"] = last_msg_id
         entry["updated_at"] = updated_at
@@ -363,7 +399,9 @@ async def save_pair_watermark(
         if isinstance(tf, dict) and int(tf.get("msg_id", 0) or 0) <= last_msg_id:
             entry.pop("transient_fail", None)
         state[name] = entry
-        save_state(state)
+        # fsync in a worker thread — _save_lock is held, so ordering is safe
+        # and the event loop stays responsive on slow flash.
+        await asyncio.to_thread(save_state, state)
 
 
 async def record_transient_fail(name: str, msg_id: int) -> int:
@@ -382,7 +420,7 @@ async def record_transient_fail(name: str, msg_id: int) -> int:
             count = 1
         entry["transient_fail"] = {"msg_id": int(msg_id), "count": count}
         state[name] = entry
-        save_state(state)
+        await asyncio.to_thread(save_state, state)
         return count
 
 
@@ -401,6 +439,18 @@ def _transient_skip_after(pair: dict) -> int:
 
 def _pair_key(pair: dict) -> str:
     return pair.get("name") or f"{pair['source']}:{pair['dest']}"
+
+
+def _is_forwards_restricted(err: BaseException) -> bool:
+    """True when the RPC failed because the source has noforwards enabled.
+
+    This is a transport-mode problem (should be copy-mode), NOT a broken
+    message — skipping+advancing would silently drop content. Name-based
+    check keeps us robust across Telethon versions.
+    """
+    if type(err).__name__ == "ChatForwardsRestrictedError":
+        return True
+    return "FORWARDS_RESTRICTED" in str(err).upper()
 
 
 # ── Retry queue for messages skipped after consecutive transient failures ──
@@ -432,7 +482,9 @@ def load_retry_queue() -> dict:
 
 async def _flush_retry_queue_locked(data: dict) -> None:
     """Caller must hold _retry_lock. Atomic write via .tmp+fsync+replace."""
-    _atomic_write_json(_resolve_retry_queue_path(), data, indent=2, sort_keys=True)
+    await asyncio.to_thread(
+        _atomic_write_json, _resolve_retry_queue_path(), data, indent=2, sort_keys=True
+    )
 
 
 async def enqueue_retry(
@@ -771,6 +823,21 @@ def _msg_media_size_bytes(msg) -> int:
 # pile up on disk during the download-ahead pipeline (important on OpenWrt).
 _COPY_LARGE_FILE_BYTES = 20 * 1024 * 1024
 
+# Coalesced watermark persistence (flash write amplification control).
+# In-memory last_ok_id advances immediately; the full-file RMW+fsync of
+# watermarks.json happens every N advances or every 30s, whichever first —
+# so bursts of small copies (stickers/photos) batch up, while slow large
+# files still effectively persist per-message via the time floor. Crash
+# durability trade: up to N-1 successes may be re-walked after a hard kill,
+# but the message_map is force-flushed BEFORE each coalesced watermark write
+# (map-first ordering), so re-walked messages hit lookup_dest_id and are
+# skipped — no duplicates in the destination.
+_WM_FLUSH_EVERY = 25
+_WM_FLUSH_MAX_AGE = 30.0
+# Already-mapped fast-forward has no upload at all (map is already on disk),
+# so a much coarser cadence is safe — crash just re-walks map hits.
+_WM_MAPPED_FLUSH_EVERY = 200
+
 
 def _copy_concurrency(pair: dict, dl: TelegramDownloader) -> int:
     """Clamp copy-mode download-ahead concurrency to 1–3."""
@@ -934,6 +1001,8 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
     ok = fail = 0
     last_ok_id = watermark
     highest_seen_id = scan_from  # advances for every walked msg (match or not)
+    wm_dirty = 0                 # advances since last on-disk watermark write
+    wm_last_flush = time.monotonic()
 
     async def _persist_wm(
         *,
@@ -948,6 +1017,7 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
         instead of permanently skipping it. Also force-flushes message_map so
         crash recovery cannot leave last_msg_id ahead of an unflushed map.
         """
+        nonlocal wm_dirty, wm_last_flush
         now = int(time.time())
         sid = highest_seen_id if scanned is None else scanned
         if cap_scanned_to_ok:
@@ -960,8 +1030,27 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
         await save_pair_watermark(
             name, last_ok_id, now, last_scanned_id=sid,
         )
+        wm_dirty = 0
+        wm_last_flush = time.monotonic()
         if cap_scanned_to_ok:
             await flush_message_map()
+
+    async def _persist_wm_coalesced(*, every: int = _WM_FLUSH_EVERY) -> None:
+        """Deferred watermark write — see _WM_FLUSH_EVERY comment.
+
+        Memory (last_ok_id / state[name]) is authoritative during the run; the
+        disk write is batched. Map is flushed FIRST so a crash between the two
+        writes leaves map-ahead-of-wm (harmless dedup data), never an uploaded
+        message above the on-disk wm but missing from the map (duplicates).
+        Abort / park / permanent-skip / end-of-run paths call _persist_wm
+        directly for immediate durability.
+        """
+        nonlocal wm_dirty
+        wm_dirty += 1
+        if wm_dirty < every and (time.monotonic() - wm_last_flush) < _WM_FLUSH_MAX_AGE:
+            return
+        await flush_message_map()
+        await _persist_wm()
 
     if use_native:
         # Native server-side forward, STREAMING in batches of up to 100.
@@ -1088,6 +1177,20 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                             file=sys.stderr,
                         )
                         raise TransientNetworkAbort(m.id, err)
+                    if _is_forwards_restricted(err):
+                        # Source flipped noforwards mid-run (or the cached
+                        # protection flag went stale): abort WITHOUT advancing
+                        # — these messages must go through copy-mode, not be
+                        # skipped. Drop the cache so the next run re-resolves.
+                        fail += 1
+                        dl.invalidate_protected_cache(source)
+                        print(
+                            f"[{name}] msg #{m.id} forwards-restricted — source "
+                            f"needs copy-mode; aborting run "
+                            f"(watermark stays at #{last_ok_id})",
+                            file=sys.stderr,
+                        )
+                        raise TransientNetworkAbort(m.id, err)
                     print(f"[{name}] msg #{m.id} failed: {err} — skipping")
                     fail += 1
                     # Advance past the single bad message so we don't loop forever.
@@ -1197,11 +1300,12 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                 if not _matches_type(m, ftype, dl):
                     continue
                 # Already mirrored (e.g. partial-batch gap recovery) — advance
-                # past without re-forwarding.
+                # past without re-forwarding. Coalesced persist: a large mapped
+                # backlog would otherwise do one full-file fsync per message.
                 if lookup_dest_id(name, m.id) is not None:
                     if m.id > last_ok_id:
                         last_ok_id = m.id
-                        await _persist_wm()
+                        await _persist_wm_coalesced(every=_WM_MAPPED_FLUSH_EVERY)
                     continue
                 batch.append(m)
                 if len(batch) >= BATCH:
@@ -1370,11 +1474,17 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                 inflight.add(task)
                 task.add_done_callback(inflight.discard)
                 # Bound in-flight downloads roughly to concurrency so we don't
-                # queue thousands of tasks on a huge backlog.
+                # queue thousands of tasks on a huge backlog. asyncio.wait wakes
+                # as soon as any slot frees (vs fixed 50ms polling); the 0.5s
+                # timeout keeps cancel/abort responsive.
                 while len(inflight) >= concurrency * 2:
                     if aborted_transient or cancelled:
                         break
-                    await asyncio.sleep(0.05)
+                    await asyncio.wait(
+                        list(inflight),
+                        return_when=asyncio.FIRST_COMPLETED,
+                        timeout=0.5,
+                    )
                     if job and job.get("cancel"):
                         cancelled = True
                         break
@@ -1394,6 +1504,18 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
     async def _uploader():
         nonlocal ok, fail, last_ok_id, next_upload_idx, cancelled, aborted_transient
         processed = 0
+
+        def _job_progress(**extra) -> None:
+            """Push the current counters into the job dict (plus overrides).
+            Reads the enclosing locals at call time, so one helper replaces the
+            six previously copy-pasted job.update blocks."""
+            if job:
+                job.update({
+                    "done": processed, "ok": ok, "fail": fail,
+                    "last_id": last_ok_id, "total": max(next_slot, processed),
+                    **extra,
+                })
+
         while True:
             if job and job.get("cancel"):
                 cancelled = True
@@ -1428,25 +1550,18 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
 
             if item.get("skip_oversize"):
                 # Intentional permanent skip: advance watermark so the stream
-                # is not permanently pinned to this large file.
+                # is not permanently pinned to this large file. Coalesced —
+                # crash before the write just re-walks and re-skips (idempotent).
                 last_ok_id = max(last_ok_id, m.id)
-                await _persist_wm()
-                if job:
-                    job.update({
-                        "done": processed, "ok": ok, "fail": fail,
-                        "last_id": last_ok_id, "total": max(next_slot, processed),
-                    })
+                await _persist_wm_coalesced()
+                _job_progress()
                 next_upload_idx += 1
                 continue
 
             if item.get("already_mapped"):
                 last_ok_id = max(last_ok_id, m.id)
-                await _persist_wm()
-                if job:
-                    job.update({
-                        "done": processed, "ok": ok, "fail": fail,
-                        "last_id": last_ok_id, "total": max(next_slot, processed),
-                    })
+                await _persist_wm_coalesced(every=_WM_MAPPED_FLUSH_EVERY)
+                _job_progress()
                 next_upload_idx += 1
                 continue
 
@@ -1501,23 +1616,11 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                         f"(watermark stays at #{last_ok_id})",
                         file=sys.stderr, flush=True,
                     )
-                    if job:
-                        job.update({
-                            "done": processed, "ok": ok, "fail": fail,
-                            "last_id": last_ok_id, "total": max(next_slot, processed),
-                            "status": "error",
-                            "error": "flood wait abort",
-                        })
+                    _job_progress(status="error", error="flood wait abort")
                     return
                 if is_transient_error(err):
                     if not await _handle_transient(err):
-                        if job:
-                            job.update({
-                                "done": processed, "ok": ok, "fail": fail,
-                                "last_id": last_ok_id, "total": max(next_slot, processed),
-                                "status": "error",
-                                "error": "transient network abort",
-                            })
+                        _job_progress(status="error", error="transient network abort")
                         return
                     # skipped — fall through to advance next_upload_idx
                 else:
@@ -1532,13 +1635,7 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                 # transient_skip_after is hit). FloodWait exhaustion re-raises
                 # and is handled via the err path above.
                 if not await _handle_transient("download returned no payload after retries"):
-                    if job:
-                        job.update({
-                            "done": processed, "ok": ok, "fail": fail,
-                            "last_id": last_ok_id, "total": max(next_slot, processed),
-                            "status": "error",
-                            "error": "transient network abort",
-                        })
+                    _job_progress(status="error", error="transient network abort")
                     return
             else:
                 try:
@@ -1557,25 +1654,13 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                         f"(watermark stays at #{last_ok_id})",
                         file=sys.stderr, flush=True,
                     )
-                    if job:
-                        job.update({
-                            "done": processed, "ok": ok, "fail": fail,
-                            "last_id": last_ok_id, "total": max(next_slot, processed),
-                            "status": "error",
-                            "error": "flood wait abort",
-                        })
+                    _job_progress(status="error", error="flood wait abort")
                     return
                 except Exception as e:
                     print(f"[{name}] ✗ ul src#{m.id}: {e}", flush=True)
                     if is_transient_error(e):
                         if not await _handle_transient(e):
-                            if job:
-                                job.update({
-                                    "done": processed, "ok": ok, "fail": fail,
-                                    "last_id": last_ok_id, "total": max(next_slot, processed),
-                                    "status": "error",
-                                    "error": "transient network abort",
-                                })
+                            _job_progress(status="error", error="transient network abort")
                             return
                         sent = "skipped_permanent"
                     else:
@@ -1588,42 +1673,27 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                         sent = "skipped_permanent"
                 if sent and sent != "skipped_permanent":
                     ok += 1
-                    last_ok_id = m.id
-                    await _persist_wm()
                     dest_msg_id = getattr(sent, "id", None)
                     if dest_msg_id is not None:
-                        # Per-msg map stays coalesced; end-of-run / abort
-                        # flush_message_map covers durability. force_flush here
-                        # would thrash OpenWrt flash on large copy backlogs.
+                        # Record the mapping BEFORE the (coalesced) watermark
+                        # write: map-first ordering means a crash can only leave
+                        # map-ahead-of-wm (harmless), never an uploaded msg
+                        # above the on-disk wm but missing from the map.
                         await record_mappings(name, [(m.id, dest_msg_id)])
+                    last_ok_id = m.id
+                    await _persist_wm_coalesced()
                 elif sent is None and not aborted_transient:
                     # upload returned None after internal retries → treat as
                     # transient so the next cycle re-tries this message.
                     if not await _handle_transient("upload returned no result after retries"):
-                        if job:
-                            job.update({
-                                "done": processed, "ok": ok, "fail": fail,
-                                "last_id": last_ok_id, "total": max(next_slot, processed),
-                                "status": "error",
-                                "error": "transient network abort",
-                            })
+                        _job_progress(status="error", error="transient network abort")
                         return
 
             if aborted_transient:
-                if job:
-                    job.update({
-                        "done": processed, "ok": ok, "fail": fail,
-                        "last_id": last_ok_id, "total": max(next_slot, processed),
-                        "status": "error",
-                        "error": "transient network abort",
-                    })
+                _job_progress(status="error", error="transient network abort")
                 return
 
-            if job:
-                job.update({
-                    "done": processed, "ok": ok, "fail": fail,
-                    "last_id": last_ok_id, "total": max(next_slot, processed),
-                })
+            _job_progress()
             if processed % 25 == 0:
                 print(f"[{name}] progress {processed} (ok={ok} fail={fail})", flush=True)
             next_upload_idx += 1
@@ -1682,6 +1752,11 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
 async def run_once(dl: Optional[TelegramDownloader] = None) -> dict:
     cfg = load_pairs()
     state = load_state()
+    # Standalone mode (python automate.py) has no server startup hook — make
+    # sure the on-disk message map is loaded so lookup_dest_id dedup works and
+    # the first flush can't clobber history with an empty in-memory map.
+    if not _msg_map_loaded:
+        load_message_map()
     pairs = cfg.get("pairs", [])
     if not pairs:
         print("No pairs configured — nothing to do.")

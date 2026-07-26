@@ -118,7 +118,9 @@ def _log_event(event: dict) -> None:
         del _run_log[: len(_run_log) - _RUN_LOG_MAX]
     try:
         from automate import _atomic_write_json
-        _atomic_write_json(RUN_LOG_PATH, _run_log[-_RUN_LOG_MAX:])
+        # fsync=False: ring-buffer log, losing the tail on power-cut is fine —
+        # not worth stalling the event loop on slow flash for every event.
+        _atomic_write_json(RUN_LOG_PATH, _run_log[-_RUN_LOG_MAX:], fsync=False)
     except Exception:
         pass
 

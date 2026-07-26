@@ -21,6 +21,23 @@ from telethon.errors import FloodWaitError
 
 from retry_utils import is_transient_error, sleep_backoff
 
+
+async def retry_once_on_flood(fn, *, label: str = ""):
+    """Run *fn* (async callable), honouring one FloodWait then retrying once.
+
+    Shared by forward_topic / forward_chat / the oneshot API endpoint, which
+    all used to copy-paste this exact sleep-and-retry block. A second
+    FloodWait (or any other error) propagates to the caller's normal
+    exception handling.
+    """
+    try:
+        return await fn()
+    except FloodWaitError as fw:
+        prefix = f"{label}: " if label else ""
+        print(f"\n  ⏳ {prefix}flood wait {fw.seconds}s...")
+        await asyncio.sleep(fw.seconds + 1)
+        return await fn()
+
 if hasattr(sys.stdout, "reconfigure") and sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure") and sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
@@ -117,6 +134,14 @@ class TelegramDownloader:
         self.max_concurrent = config.get("max_concurrent_downloads", 3)
         self.client: Optional[TelegramClient] = None
         self.progress_tracker: dict[str, DownloadProgress] = {}
+        # noforwards resolution cache: {str(source_id): (protected, expires_at)}.
+        # Saves one get_entity RPC per pair per scheduler cycle.
+        self._noforwards_cache: dict[str, tuple[bool, float]] = {}
+
+    # How long a successful noforwards resolution stays cached. Failures cache
+    # much shorter so a flaky resolve doesn't pin copy-mode for 10 minutes.
+    _PROTECTED_TTL = 600.0
+    _PROTECTED_ERR_TTL = 60.0
 
     async def start(self):
         session_string = os.environ.get("TELETHON_SESSION_STRING")
@@ -330,15 +355,30 @@ class TelegramDownloader:
         """Return True when the source forbids forwarding (must use copy-mode).
 
         Fail-safe: any resolve error returns True so we never attempt a native
-        forward that would 400. Callers that already hold the entity can pass
-        it and skip the extra RPC via the noforwards attribute themselves.
+        forward that would 400. Results are cached (_PROTECTED_TTL) — the flag
+        almost never changes, and re-resolving every run_pair cost one RPC per
+        pair per cycle. If a source flips noforwards mid-TTL, the native path
+        detects FORWARDS_RESTRICTED, aborts without skipping, and calls
+        invalidate_protected_cache() so the next run re-resolves.
         """
+        key = str(source_id)
+        now = time.monotonic()
+        hit = self._noforwards_cache.get(key)
+        if hit is not None and now < hit[1]:
+            return hit[0]
         try:
             entity = await self.client.get_entity(source_id)
-            return bool(getattr(entity, "noforwards", False))
+            val = bool(getattr(entity, "noforwards", False))
+            self._noforwards_cache[key] = (val, now + self._PROTECTED_TTL)
+            return val
         except Exception as e:
             print(f"  couldn't resolve source {source_id} for noforwards check: {e} — assuming protected")
+            self._noforwards_cache[key] = (True, now + self._PROTECTED_ERR_TTL)
             return True
+
+    def invalidate_protected_cache(self, source_id) -> None:
+        """Drop the cached noforwards flag (e.g. after FORWARDS_RESTRICTED)."""
+        self._noforwards_cache.pop(str(source_id), None)
 
     @staticmethod
     def _transfer_timeout(size_bytes: int) -> float:
@@ -778,22 +818,15 @@ class TelegramDownloader:
             for i in range(0, total, batch_size):
                 batch = messages_to_send[i:i + batch_size]
                 try:
-                    await self.forward_batch(source_id, dest_id, batch, drop_author=True)
+                    await retry_once_on_flood(
+                        lambda b=batch: self.forward_batch(source_id, dest_id, b, drop_author=True)
+                    )
                     stats["forwarded"] += len(batch)
                     print(f"  ✓ Forwarded {stats['forwarded']}/{total}", end="\r", flush=True)
                     if on_progress:
                         on_progress(stats["forwarded"], total)
                     if i + batch_size < total:
                         await asyncio.sleep(delay)
-                except FloodWaitError as fw:
-                    print(f"\n  ⏳ Flood wait {fw.seconds}s...")
-                    await asyncio.sleep(fw.seconds)
-                    try:
-                        await self.forward_batch(source_id, dest_id, batch, drop_author=True)
-                        stats["forwarded"] += len(batch)
-                    except Exception as e2:
-                        stats["failed"] += len(batch)
-                        print(f"  ✗ Retry failed: {e2}")
                 except Exception as e:
                     stats["failed"] += len(batch)
                     print(f"\n  ✗ Batch failed: {e}")
@@ -875,22 +908,15 @@ class TelegramDownloader:
             for i in range(0, total, batch_size):
                 batch = messages_to_forward[i:i + batch_size]
                 try:
-                    await self.client.forward_messages(dest_id, batch, source_id)
+                    await retry_once_on_flood(
+                        lambda b=batch: self.client.forward_messages(dest_id, b, source_id)
+                    )
                     stats["forwarded"] += len(batch)
                     print(f"  ✓ Forwarded {stats['forwarded']}/{total}", end="\r", flush=True)
                     if on_progress:
                         on_progress(stats["forwarded"], total)
                     if i + batch_size < total:
                         await asyncio.sleep(delay)
-                except FloodWaitError as fw:
-                    print(f"\n  ⏳ Flood wait {fw.seconds}s...")
-                    await asyncio.sleep(fw.seconds)
-                    try:
-                        await self.client.forward_messages(dest_id, batch, source_id)
-                        stats["forwarded"] += len(batch)
-                    except Exception as e2:
-                        stats["failed"] += len(batch)
-                        print(f"  ✗ Retry failed: {e2}")
                 except Exception as e:
                     stats["failed"] += len(batch)
                     print(f"\n  ✗ Batch failed: {e}")
