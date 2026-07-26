@@ -119,7 +119,8 @@ templates/index.html ► Quart SPA
 
 - **`save_pair_watermark`**：进程内锁 + 磁盘 RMW **只改一个 pair key**。禁止用“内存整份 state 再整文件写回”覆盖其他 key
 - **默认拒绝回退**：新 `last_msg_id` < 磁盘值则丢弃；仅 `POST /api/pairs/<name>/watermark` 用 `allow_regression=True`（未显式传 `last_scanned_id` 时会把 scanned 一并压到新 wm）
-- **`last_scanned_id`**：iterator 扫过的最高源 msg id（含 type 不匹配）。`min_id = max(last_msg_id, last_scanned_id)`。**瞬时 abort / 部分 native batch 空洞** 时 scanned 必须 cap 到 `last_ok_id`，否则会永久跳过失败区间。改 `type` 后若需回扫历史，用 watermark API 回退（两者一起）
+- **`last_scanned_id`**：iterator 扫过的最高源 msg id（含 type 不匹配）。`min_id = max(last_msg_id, last_scanned_id)`。磁盘上 scanned **默认不回退**（`save_pair_watermark` 同 wm 一样拒绝），所以**运行中的一切写盘一律 cap 到 `last_ok_id`**（copy 生产者跑在 uploader 前面，中途发布超前 scanned 后 abort 时压不回来 = 永久空洞）；只有**健康跑完**的收尾写才 `publish_scanned=True` 发布完整扫描位。abort / cancel / 硬杀都不得留下超前 scanned。改 `type` 后若需回扫历史，用 watermark API 回退（两者一起）
+- **合并写盘（copy 成功路径）**：内存 `last_ok_id` 立即前进；每条成功做一次 **无 fsync** 页缓存写（进程被杀不回退 wm → 无重复），每 25 条或 30s 做一次完整 fsync（**map 先于 wm**）。断电最多回退一个窗口（≤24 条可能重复）；abort / park / 永久 skip / 收尾走 `_persist_wm` 立即 fsync。已映射快进与 oversize skip 传 `cheap_write=False`（回退只是幂等重扫，不值得逐条写盘）
 - **Per-pair asyncio lock**：同 pair 同时只能一个 `run_pair`（冲突 `skipped_locked`）；drain/repair/set-watermark 也拿同一把锁
 - **`name` 是 watermark key**：改名 = 新 pair，会从空状态重跑
 - 删除 pair **不删** watermark（重加时可避免重转历史）

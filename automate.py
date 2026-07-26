@@ -321,8 +321,8 @@ def load_state() -> dict:
         ) from e
 
 
-def save_state(state: dict) -> None:
-    _atomic_write_json(_resolve_state_path(), state, indent=2, sort_keys=True)
+def save_state(state: dict, *, fsync: bool = True) -> None:
+    _atomic_write_json(_resolve_state_path(), state, indent=2, sort_keys=True, fsync=fsync)
 
 
 # Serializes the per-pair atomic save. Without this, two concurrent runners
@@ -342,6 +342,7 @@ async def save_pair_watermark(
     *,
     allow_regression: bool = False,
     last_scanned_id: Optional[int] = None,
+    fsync: bool = True,
 ) -> None:
     """Atomic read-modify-write of one pair's watermark. Reload latest from
     disk, update only this pair's key, write back. Preserves any updates other
@@ -400,8 +401,10 @@ async def save_pair_watermark(
             entry.pop("transient_fail", None)
         state[name] = entry
         # fsync in a worker thread — _save_lock is held, so ordering is safe
-        # and the event loop stays responsive on slow flash.
-        await asyncio.to_thread(save_state, state)
+        # and the event loop stays responsive on slow flash. fsync=False is
+        # the coalesced fast path: os.replace still lands the update in the
+        # page cache (survives process kill), only a power cut can lose it.
+        await asyncio.to_thread(save_state, state, fsync=fsync)
 
 
 async def record_transient_fail(name: str, msg_id: int) -> int:
@@ -823,15 +826,17 @@ def _msg_media_size_bytes(msg) -> int:
 # pile up on disk during the download-ahead pipeline (important on OpenWrt).
 _COPY_LARGE_FILE_BYTES = 20 * 1024 * 1024
 
-# Coalesced watermark persistence (flash write amplification control).
-# In-memory last_ok_id advances immediately; the full-file RMW+fsync of
-# watermarks.json happens every N advances or every 30s, whichever first —
-# so bursts of small copies (stickers/photos) batch up, while slow large
-# files still effectively persist per-message via the time floor. Crash
-# durability trade: up to N-1 successes may be re-walked after a hard kill,
-# but the message_map is force-flushed BEFORE each coalesced watermark write
-# (map-first ordering), so re-walked messages hit lookup_dest_id and are
-# skipped — no duplicates in the destination.
+# Coalesced watermark persistence (flash fsync amplification control).
+# In-memory last_ok_id advances immediately. Every upload success also does a
+# CHEAP non-fsync watermark write (os.replace → page cache): a process kill
+# (OOM, SIGKILL, docker kill) therefore cannot regress the on-disk watermark
+# below already-uploaded messages — no re-walk, no duplicates. The full
+# fsync'd pass (message_map first, then watermark) runs every N advances or
+# every 30s, whichever first, so slow large files still persist durably
+# per-message via the time floor. Residual trade: a POWER CUT can drop the
+# non-fsynced tail — up to N-1 successes re-walk, and any of them absent from
+# the last fsynced message_map re-forward as duplicates. Abort / park /
+# permanent-skip / end-of-run paths bypass coalescing via _persist_wm.
 _WM_FLUSH_EVERY = 25
 _WM_FLUSH_MAX_AGE = 30.0
 # Already-mapped fast-forward has no upload at all (map is already on disk),
@@ -1008,19 +1013,33 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
         *,
         scanned: Optional[int] = None,
         cap_scanned_to_ok: bool = False,
+        durable: bool = True,
+        publish_scanned: bool = False,
     ) -> None:
         """Write last_ok_id (+ optional scanned cursor) to disk.
 
-        *cap_scanned_to_ok*: when True, never store last_scanned_id above
-        last_ok_id. Required after transient abort / unconfirmed batch gaps so
-        the next cycle's scan_from=max(wm, scanned) still re-visits the hole
-        instead of permanently skipping it. Also force-flushes message_map so
-        crash recovery cannot leave last_msg_id ahead of an unflushed map.
+        *publish_scanned=False* (default, all mid-run writes): store scanned
+        capped at last_ok_id. The copy producer walks ahead of the uploader,
+        so highest_seen_id can be far above messages still pending upload; if
+        a mid-run write published it and the run then aborted / was cancelled
+        / got hard-killed, the abort-time cap could not undo it —
+        save_pair_watermark refuses scanned regression without
+        allow_regression — and scan_from would permanently skip the pending
+        range. Only the healthy end-of-run write passes publish_scanned=True
+        to advance the scan floor past non-matching history.
+
+        *cap_scanned_to_ok*: abort-path variant of the same cap. Also
+        force-flushes message_map so crash recovery cannot leave last_msg_id
+        ahead of an unflushed map.
+
+        *durable=False*: skip the fsync barrier (page-cache-only write) and
+        leave the coalescing counters untouched — used between full flushes so
+        a process kill cannot regress the watermark below uploaded messages.
         """
         nonlocal wm_dirty, wm_last_flush
         now = int(time.time())
         sid = highest_seen_id if scanned is None else scanned
-        if cap_scanned_to_ok:
+        if cap_scanned_to_ok or not publish_scanned:
             sid = min(int(sid), int(last_ok_id))
         state[name] = {
             "last_msg_id": last_ok_id,
@@ -1028,26 +1047,40 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             "last_scanned_id": sid,
         }
         await save_pair_watermark(
-            name, last_ok_id, now, last_scanned_id=sid,
+            name, last_ok_id, now, last_scanned_id=sid, fsync=durable,
         )
+        if not durable:
+            return
         wm_dirty = 0
         wm_last_flush = time.monotonic()
         if cap_scanned_to_ok:
             await flush_message_map()
 
-    async def _persist_wm_coalesced(*, every: int = _WM_FLUSH_EVERY) -> None:
-        """Deferred watermark write — see _WM_FLUSH_EVERY comment.
+    async def _persist_wm_coalesced(
+        *, every: int = _WM_FLUSH_EVERY, cheap_write: bool = True
+    ) -> None:
+        """Deferred durable watermark write — see _WM_FLUSH_EVERY comment.
 
-        Memory (last_ok_id / state[name]) is authoritative during the run; the
-        disk write is batched. Map is flushed FIRST so a crash between the two
-        writes leaves map-ahead-of-wm (harmless dedup data), never an uploaded
-        message above the on-disk wm but missing from the map (duplicates).
+        Between full flushes, *cheap_write* persists the advance WITHOUT
+        fsync so a process kill cannot leave uploaded messages above the
+        on-disk watermark (which would re-walk into duplicates). Only a power
+        cut can drop those page-cache writes, bounded by the durable cadence.
+        Pass cheap_write=False on paths where a regressed watermark merely
+        re-walks idempotent work (already-mapped fast-forward — dedup is on
+        disk; oversize skips — re-skipping is free): there the per-message
+        write is pure flash churn with no correctness payoff.
+
+        At the durable boundary the map is flushed FIRST: a crash between the
+        two fsyncs leaves map-ahead-of-wm (harmless dedup data), never an
+        uploaded message above the durable wm but missing from the map.
         Abort / park / permanent-skip / end-of-run paths call _persist_wm
         directly for immediate durability.
         """
         nonlocal wm_dirty
         wm_dirty += 1
         if wm_dirty < every and (time.monotonic() - wm_last_flush) < _WM_FLUSH_MAX_AGE:
+            if cheap_write:
+                await _persist_wm(durable=False)
             return
         await flush_message_map()
         await _persist_wm()
@@ -1305,7 +1338,7 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                 if lookup_dest_id(name, m.id) is not None:
                     if m.id > last_ok_id:
                         last_ok_id = m.id
-                        await _persist_wm_coalesced(every=_WM_MAPPED_FLUSH_EVERY)
+                        await _persist_wm_coalesced(every=_WM_MAPPED_FLUSH_EVERY, cheap_write=False)
                     continue
                 batch.append(m)
                 if len(batch) >= BATCH:
@@ -1328,23 +1361,29 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                 job["status"] = "error"
                 job["error"] = str(abort)
         # Persist scanned cursor even when nothing matched (type filter).
-        # On transient abort, cap last_scanned_id at last_ok_id so the next
-        # cycle re-walks the failed range (scan_from = max(wm, scanned)).
+        # Only a HEALTHY completion publishes the full scan floor; on abort /
+        # cancel the walked-but-unforwarded range must stay below scan_from so
+        # the next cycle re-walks it (scan_from = max(wm, scanned)).
+        run_healthy = not aborted_transient and not (job and job.get("cancel"))
         if highest_seen_id > scan_from or last_ok_id != watermark or aborted_transient:
-            await _persist_wm(cap_scanned_to_ok=aborted_transient)
+            await _persist_wm(
+                cap_scanned_to_ok=aborted_transient,
+                publish_scanned=run_healthy,
+            )
         await flush_message_map()
         if job and job["status"] == "running":
             job["status"] = "finished"
+        scanned_out = (
+            highest_seen_id if run_healthy else min(highest_seen_id, last_ok_id)
+        )
         print(f"[{name}] done: forwarded={ok} failed={fail} new_watermark=#{last_ok_id}"
-              f" scanned=#{min(highest_seen_id, last_ok_id) if aborted_transient else highest_seen_id}"
+              f" scanned=#{scanned_out}"
               f"{' (aborted_transient)' if aborted_transient else ''}")
         return {
             "forwarded": ok,
             "failed": fail,
             "last_id": last_ok_id,
-            "last_scanned_id": (
-                min(highest_seen_id, last_ok_id) if aborted_transient else highest_seen_id
-            ),
+            "last_scanned_id": scanned_out,
             **({"aborted_transient": True} if aborted_transient else {}),
         }
 
@@ -1553,14 +1592,14 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                 # is not permanently pinned to this large file. Coalesced —
                 # crash before the write just re-walks and re-skips (idempotent).
                 last_ok_id = max(last_ok_id, m.id)
-                await _persist_wm_coalesced()
+                await _persist_wm_coalesced(cheap_write=False)
                 _job_progress()
                 next_upload_idx += 1
                 continue
 
             if item.get("already_mapped"):
                 last_ok_id = max(last_ok_id, m.id)
-                await _persist_wm_coalesced(every=_WM_MAPPED_FLUSH_EVERY)
+                await _persist_wm_coalesced(every=_WM_MAPPED_FLUSH_EVERY, cheap_write=False)
                 _job_progress()
                 next_upload_idx += 1
                 continue
@@ -1724,14 +1763,20 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
         elif job.get("status") == "running":
             job["status"] = "finished"
 
-    # On transient abort, cap last_scanned_id at last_ok_id so download-ahead
-    # that walked past the failure does not permanently skip the hole.
+    # Only a HEALTHY completion publishes the full scan floor. On transient
+    # abort AND on cancel, download-ahead walked past messages that were never
+    # uploaded — the scanned cursor must stay capped at last_ok_id so the next
+    # cycle re-walks the hole instead of permanently skipping it.
+    run_healthy = not aborted_transient and not cancelled
     if highest_seen_id > scan_from or last_ok_id != watermark or aborted_transient:
-        await _persist_wm(cap_scanned_to_ok=aborted_transient)
+        await _persist_wm(
+            cap_scanned_to_ok=aborted_transient,
+            publish_scanned=run_healthy,
+        )
     await flush_message_map()
 
     scanned_out = (
-        min(highest_seen_id, last_ok_id) if aborted_transient else highest_seen_id
+        highest_seen_id if run_healthy else min(highest_seen_id, last_ok_id)
     )
     if next_slot == 0 and not aborted_transient:
         print(f"[{name}] no new messages")

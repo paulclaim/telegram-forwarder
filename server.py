@@ -24,11 +24,11 @@ from typing import Optional
 from quart import Quart, request, jsonify, render_template, Response
 
 from telethon import events, utils as tg_utils
-from telethon.errors import FloodWaitError, MessageNotModifiedError
+from telethon.errors import MessageNotModifiedError
 from telethon.tl.functions.channels import CreateChannelRequest, ToggleForumRequest
 from telethon.tl.functions.messages import CreateForumTopicRequest
 
-from downloader import TelegramDownloader, load_config
+from downloader import TelegramDownloader, load_config, retry_once_on_flood
 from automate import (
     BASE_DIR,
     load_pairs,
@@ -972,24 +972,16 @@ async def api_forward_once():
                     job["status"] = "cancelled"
                     break
                 batch = msgs[start:start + BATCH]
-                try:
+
+                async def _send(b=batch):
                     if dest_topic and dest_topic > 1:
-                        await _dl.forward_batch(source, dest, batch, drop_author=True, top_msg_id=dest_topic)
+                        await _dl.forward_batch(source, dest, b, drop_author=True, top_msg_id=dest_topic)
                     else:
-                        await _dl.client.forward_messages(dest, batch, source, drop_author=True)
+                        await _dl.client.forward_messages(dest, b, source, drop_author=True)
+
+                try:
+                    await retry_once_on_flood(_send, label=f"oneshot {source}->{dest}")
                     ok += len(batch)
-                except FloodWaitError as fw:
-                    print(f"[oneshot {source}->{dest}] flood wait {fw.seconds}s")
-                    await asyncio.sleep(fw.seconds + 1)
-                    try:
-                        if dest_topic and dest_topic > 1:
-                            await _dl.forward_batch(source, dest, batch, drop_author=True, top_msg_id=dest_topic)
-                        else:
-                            await _dl.client.forward_messages(dest, batch, source, drop_author=True)
-                        ok += len(batch)
-                    except Exception as e:
-                        print(f"[oneshot {source}->{dest}] batch retry failed: {e}")
-                        fail += len(batch)
                 except Exception as e:
                     print(f"[oneshot {source}->{dest}] batch failed: {e}")
                     fail += len(batch)
