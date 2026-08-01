@@ -384,11 +384,17 @@ class TelegramDownloader:
     def _transfer_timeout(size_bytes: int) -> float:
         """Adaptive download/upload timeout based on file size.
 
-        Assumes a conservative ~200 KiB/s floor plus 30s headroom, clamped to
-        [60s, 1800s]. Replaces the old fixed 300s cap that false-timed-out
-        large videos on slow links and over-waited on tiny stickers.
+        Adaptive download/upload timeout with separate profiles for small and
+        large files. Small/medium files keep the fast "stall" behavior (200 KiB/s
+        floor + 30s headroom, [60s, 1800s]). Large files (>=25 MiB) use a lower
+        100 KiB/s floor and a 3600s cap so a ~600MB video on a 100-200 KiB/s link
+        (OpenWrt to Telegram CDN) gets one full attempt to finish instead of
+        false-timing-out at the 1800s boundary every cycle.
         """
         size = max(0, int(size_bytes or 0))
+        large_threshold = 25 * 1024 * 1024
+        if size >= large_threshold:
+            return float(min(3600, max(600, size / (100 * 1024) + 60)))
         return float(min(1800, max(60, size / (200 * 1024) + 30)))
 
     @staticmethod
