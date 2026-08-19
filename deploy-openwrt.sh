@@ -24,7 +24,10 @@ REMOTE_DIR="${TG_FORWARDER_REMOTE_DIR:-/root/tg-forwarder}"
 SSH_OPTS="${TG_FORWARDER_SSH_OPTS:--o ConnectTimeout=8}"
 INIT_SCRIPT="tg-forwarder.init"
 INIT_CONFIG="tg-forwarder.config"
+RUNNER_SCRIPT="tg-forwarder-openwrt.sh"
+READY_SCRIPT="scripts/openwrt/wait-runtime-ready.sh"
 PY_DEPS="telethon quart hypercorn openpyxl"
+TARGET_MARKER=".tg-forwarder-root"
 
 # 将选项解析为数组，避免通配符展开。含空格的 ProxyCommand 等复杂配置应写进 ~/.ssh/config。
 read -r -a SSH_ARGS <<< "$SSH_OPTS"
@@ -41,6 +44,12 @@ esac
 case "$REMOTE_DIR" in
   *[!A-Za-z0-9_./-]*) echo "远程目录包含不支持的字符: $REMOTE_DIR" >&2; exit 1 ;;
 esac
+case "$REMOTE_DIR" in
+  /|/.) echo "远程目录不能是文件系统根目录: $REMOTE_DIR" >&2; exit 1 ;;
+esac
+case "$REMOTE_DIR/" in
+  *//*|*/./*|*/../*) echo "远程目录不能包含空、. 或 .. 路径段: $REMOTE_DIR" >&2; exit 1 ;;
+esac
 
 # ── 颜色 ────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -55,13 +64,16 @@ step() { echo "${B}▶${N} $*"; }
 
 install_service_files() {
   step "更新 procd 服务脚本和持久配置"
-  if [ ! -f "$INIT_SCRIPT" ] || [ ! -f "$INIT_CONFIG" ]; then
-    err "缺少 $INIT_SCRIPT 或 $INIT_CONFIG"
+  if [ ! -f "$INIT_SCRIPT" ] || [ ! -f "$INIT_CONFIG" ] || [ ! -f "$RUNNER_SCRIPT" ] || [ ! -f "$READY_SCRIPT" ]; then
+    err "缺少 $INIT_SCRIPT、$INIT_CONFIG、$RUNNER_SCRIPT 或 $READY_SCRIPT"
     return 1
   fi
+  ssh_run "mkdir -p '$REMOTE_DIR/scripts/openwrt'"
   scp_run "$INIT_SCRIPT" "$SSH_HOST:/etc/init.d/tg-forwarder"
   scp_run "$INIT_CONFIG" "$SSH_HOST:/tmp/tg-forwarder.config"
-  ssh_run "chmod +x /etc/init.d/tg-forwarder
+  scp_run "$RUNNER_SCRIPT" "$SSH_HOST:$REMOTE_DIR/$RUNNER_SCRIPT"
+  scp_run "$READY_SCRIPT" "$SSH_HOST:$REMOTE_DIR/$READY_SCRIPT"
+  ssh_run "chmod +x /etc/init.d/tg-forwarder '$REMOTE_DIR/$RUNNER_SCRIPT' '$REMOTE_DIR/$READY_SCRIPT'
     if [ ! -f /etc/config/tg-forwarder ]; then
       cp /tmp/tg-forwarder.config /etc/config/tg-forwarder
       echo '已创建 /etc/config/tg-forwarder（启动前必须设置 dash_pass）'
@@ -101,16 +113,19 @@ RESTART="${RESTART:-1}"
 # ── 只读动作 ─────────────────────────────────────────────────────
 if [ "$ACTION" = "status" ]; then
   step "远程运行状态"
+  # shellcheck disable=SC2016 # $health 应在 OpenWrt 端展开。
   ssh_run '/etc/init.d/tg-forwarder status 2>&1 | head -3
-                   echo "--- 进程 ---"; pgrep -af "server.py" || echo "(无进程)"
-                   echo "--- 健康检查 ---"; curl -fsS --max-time 5 http://127.0.0.1:5000/healthz || echo "(无响应)"
+                   echo "--- 进程 ---"; pgrep -af "^(/usr/bin/)?python3 .*/server\\.py$|^(/bin/)?(ash|sh) [^ ]*/tg-forwarder-openwrt\\.sh($| )" || echo "(无进程)"
+                   echo "--- 健康检查 ---"; health="$(curl -fsS --max-time 5 http://127.0.0.1:5000/healthz 2>/dev/null || true)"; if [ -n "$health" ]; then echo "$health"; else echo "(无响应)"; fi
+                   echo; echo "--- 启动门禁 ---"; date "+time=%Y-%m-%dT%H:%M:%S%z"; if [ -e /etc/hotplug.d/ntp/25-dnsmasqsec ]; then [ -e /var/state/dnsmasqsec ] && echo "ntp=ready" || echo "ntp=waiting"; else echo "ntp=unknown(no marker hook)"; fi
+                   echo; echo "--- session 诊断 ---"; if echo "$health" | grep -q "telegram_session_error.*AuthKey"; then echo "session=invalid(需重新登录并重启服务)"; elif echo "$health" | grep -q "telegram_connected.*true"; then echo "session=active"; elif grep -qi "authorization key.*different IP" '"$REMOTE_DIR"'/run_log.json 2>/dev/null; then echo "session=needs-check(历史出现 AUTH_KEY_DUPLICATED，当前 Telegram 未连接)"; else echo "session=当前未连接，未发现 AUTH_KEY_DUPLICATED"; fi
                    echo; echo "--- pairs.json ---"; if [ -f '"$REMOTE_DIR"'/pairs.json ]; then cat '"$REMOTE_DIR"'/pairs.json; else echo "(不存在)"; fi'
   exit $?
 fi
 
 if [ "$ACTION" = "logs" ]; then
-  step "远程日志(最近 40 行)"
-  ssh_run 'logread | grep -iE "tg-forwarder|scheduler|mode=|cycle|forwarded|error|exception|traceback" | tail -40'
+  step "远程日志(最近 80 行)"
+  ssh_run 'logread | grep -iE " (tg-forwarder|tg-forwarder-openwrt\\.sh)\\[[0-9]+\\]:|procd:.*tg-forwarder" | tail -80'
   exit $?
 fi
 
@@ -177,6 +192,29 @@ fi
 step "同步代码到 $SSH_HOST:$REMOTE_DIR"
 log "排除项: .venv .git .claude .spec-workflow __pycache__ *.pyc"
 log "排除项: 会话/配置/状态文件(保护远程运行态,不被覆盖)"
+step "校验远端部署目录"
+ssh_run "
+  set -eu
+  mkdir -p '$REMOTE_DIR'
+  marker='$REMOTE_DIR/$TARGET_MARKER'
+  if [ -e \"\$marker\" ]; then
+    if grep -qx 'telegram-forwarder-pro' \"\$marker\"; then
+      exit 0
+    fi
+    echo '部署目录标记内容异常，拒绝 rsync --delete：'\"\$marker\" >&2
+    exit 3
+  fi
+  if [ -z \"\$(ls -A '$REMOTE_DIR' 2>/dev/null)\" ] || {
+    [ -f '$REMOTE_DIR/server.py' ] && [ -f '$REMOTE_DIR/automate.py' ];
+  }; then
+    printf '%s\n' 'telegram-forwarder-pro' > \"\$marker\"
+    chmod 600 \"\$marker\"
+    exit 0
+  fi
+  echo '远端目录非空且不像 telegram-forwarder-pro，拒绝 rsync --delete：$REMOTE_DIR' >&2
+  exit 3
+"
+log "远端部署目录已确认"
 RSYNC_RSH="$RSYNC_SSH" rsync -avz --delete \
   --exclude='.venv' --exclude='venv' \
   --exclude='.git' --exclude='.claude' --exclude='.spec-workflow' \
@@ -186,7 +224,9 @@ RSYNC_RSH="$RSYNC_SSH" rsync -avz --delete \
   --exclude='watermarks.json' --exclude='message_map.json' --exclude='run_log.json' \
   --exclude='retry_queue.json' \
   --exclude='downloads' --exclude='temp' --exclude='data' --exclude='.env' \
+  --exclude="$TARGET_MARKER" \
   ./ "$SSH_HOST:$REMOTE_DIR/" 2>&1 | grep -vE '/$' | tail -20
+ssh_run "chmod +x '$REMOTE_DIR/$RUNNER_SCRIPT' '$REMOTE_DIR/scripts/openwrt/wait-runtime-ready.sh'"
 log "代码同步完成"
 
 # 每次部署都同步服务脚本；UCI 配置只在缺失时创建，已有密码不会被覆盖。
@@ -215,7 +255,7 @@ if [ "$RESTART" = "1" ]; then
     if [ "$ready" = 1 ]; then cat /tmp/tg-forwarder-health; else echo "(60 秒内未通过健康检查)"; fi
     rm -f /tmp/tg-forwarder-health
     echo; echo "--- 启动日志 ---"
-    logread | grep -iE "server ready|cycle start|mode=|error|exception|traceback" | tail -10
+    logread | grep -iE " (tg-forwarder|tg-forwarder-openwrt\\.sh)\\[[0-9]+\\]:|procd:.*tg-forwarder" | tail -20
     [ "$ready" = 1 ]'
   log "已重启,新代码生效"
 else

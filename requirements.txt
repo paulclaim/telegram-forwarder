@@ -1,4 +1,4 @@
-telethon>=1.36.0
+telethon>=1.36.0,<2
 python-socks[asyncio]
 cryptg>=0.4.0
 quart>=0.19.0

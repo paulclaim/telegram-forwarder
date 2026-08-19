@@ -51,7 +51,7 @@ from automate import (
     remove_retry_items,
     drain_retry_queue,
 )
-from retry_utils import ensure_connected, sleep_backoff
+from retry_utils import ensure_connected, is_fatal_session_error, sleep_backoff
 
 # ───── State ──────────────────────────────────────────────────────────────
 
@@ -68,6 +68,7 @@ ALLOW_INSECURE_OPEN_DASH = os.environ.get("ALLOW_INSECURE_OPEN_DASH", "").strip(
 _state_lock = asyncio.Lock()        # protects pairs.json + watermarks.json + run_log
 _dl: Optional[TelegramDownloader] = None  # shared Telegram client
 _scheduler_task: Optional[asyncio.Task] = None
+_telegram_session_error: Optional[str] = None
 _run_log: list[dict] = []           # in-memory ring buffer
 _RUN_LOG_MAX = 500
 RUN_LOG_PATH = Path(os.environ.get("RUN_LOG_PATH", str(BASE_DIR / "run_log.json")))
@@ -200,6 +201,7 @@ async def healthz():
         "ok": True,
         "telegram_ready": ready,
         "telegram_connected": connected,
+        "telegram_session_error": _telegram_session_error,
     }), status
 
 
@@ -1214,11 +1216,18 @@ async def api_job_cancel(job_id: str):
 
 
 async def _scheduler_loop():
+    global _telegram_session_error
     # Consecutive reconnect failures drive exponential backoff (30s → 10min).
     # Resets to 0 on a successful connect so brief blips don't accumulate.
     reconnect_fail_streak = 0
     while True:
         try:
+            if _telegram_session_error:
+                # A replaced SQLite session is not picked up by an existing
+                # TelegramClient. Stay alive for Web diagnostics, but require a
+                # service restart after a fresh session is installed.
+                await asyncio.sleep(300)
+                continue
             if _dl and not await ensure_connected(_dl.client, label="scheduler"):
                 reconnect_fail_streak += 1
                 print(
@@ -1237,13 +1246,12 @@ async def _scheduler_loop():
             interval = max(60, int(cfg.get("interval_seconds", 3600)))
             pairs = cfg.get("pairs", [])
             active = [p for p in pairs if not p.get("paused")]
+            fatal_session_detected = False
             if _paused:
                 print(f"[scheduler] PAUSED — sleeping {interval}s, next check at "
-                      f"{datetime.fromtimestamp(time.time() + interval, tz=timezone.utc).strftime('%H:%M:%S UTC')}",
-                      file=sys.stderr)
+                      f"{datetime.fromtimestamp(time.time() + interval, tz=timezone.utc).strftime('%H:%M:%S UTC')}")
             else:
-                print(f"[scheduler] cycle start — {len(active)} active pair(s), interval={interval}s",
-                      file=sys.stderr)
+                print(f"[scheduler] cycle start — {len(active)} active pair(s), interval={interval}s")
             for pair in pairs:
                 if _paused:
                     break
@@ -1281,10 +1289,19 @@ async def _scheduler_loop():
                     job.update({"status": "error", "finished_at": int(time.time())})
                     print(f"scheduler error for {name}: {e}", file=sys.stderr)
                     _log_event({"kind": "run_error", "pair": name, "error": str(e), "trigger": "scheduler", "job_id": job["id"]})
+                    if is_fatal_session_error(e):
+                        _telegram_session_error = type(e).__name__
+                        fatal_session_detected = True
+                        print(
+                            "[scheduler] FATAL Telegram session invalid; stopping scheduled "
+                            "Telegram work until a fresh session is installed and the service restarts",
+                            file=sys.stderr,
+                        )
+                        break
 
             # After the main pair cycle, drain a few parked retries so skipped
             # media is eventually recovered without blocking watermarks.
-            if not _paused and _dl:
+            if not _paused and not fatal_session_detected and _dl:
                 try:
                     rq = load_retry_queue()
                     pending_n = sum(
@@ -1316,9 +1333,16 @@ async def _scheduler_loop():
                         })
                 except Exception as e:
                     print(f"[scheduler] retry-queue drain error: {e}", file=sys.stderr)
+                    if is_fatal_session_error(e):
+                        _telegram_session_error = type(e).__name__
+                        print(
+                            "[scheduler] FATAL Telegram session invalid during retry drain; "
+                            "stopping scheduled Telegram work until service restart",
+                            file=sys.stderr,
+                        )
 
             next_run = datetime.fromtimestamp(time.time() + interval, tz=timezone.utc).strftime('%H:%M:%S UTC')
-            print(f"[scheduler] cycle done — sleeping {interval}s, next run at {next_run}", file=sys.stderr)
+            print(f"[scheduler] cycle done — sleeping {interval}s, next run at {next_run}")
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
             raise
@@ -1432,7 +1456,8 @@ def _register_event_handlers() -> None:
 
 @app.before_serving
 async def _startup():
-    global _dl, _scheduler_task
+    global _dl, _scheduler_task, _telegram_session_error
+    _telegram_session_error = None
     _load_run_log()
     # Trigger one-time pairs.json seeding from PAIRS_JSON env var if applicable.
     # Without this, a fresh volume + env var seed never lands on disk because
@@ -1443,32 +1468,45 @@ async def _startup():
         print("no pairs configured yet — add some via the web UI")
     load_message_map()
     _dl = TelegramDownloader(load_config())
-    await _dl.start()
+    try:
+        await _dl.start()
+    except Exception as exc:
+        if not is_fatal_session_error(exc):
+            raise
+        _telegram_session_error = type(exc).__name__
+        print(
+            "[startup] FATAL Telegram session invalid; Web diagnostics will remain "
+            "available, but Telegram work is disabled until a fresh session is "
+            "installed and the service restarts",
+            file=sys.stderr,
+        )
     _register_event_handlers()
     # Warm up the entity cache so the scheduler's first run can resolve channel IDs
     # immediately (a fresh session string has an empty SQLite entity cache).
     # Step 1: fetch all dialogs (populates most channels).
-    try:
-        await _dl.client.get_dialogs()
-    except Exception as e:
-        print(f"[startup] get_dialogs warmup failed (non-fatal): {e}", file=sys.stderr)
+    if not _telegram_session_error:
+        try:
+            await _dl.client.get_dialogs()
+        except Exception as e:
+            print(f"[startup] get_dialogs warmup failed (non-fatal): {e}", file=sys.stderr)
     # Step 2: explicitly resolve every source/dest ID in pairs.json so archived
     # or low-activity channels that fall outside get_dialogs results are cached too.
-    try:
-        pairs_cfg = load_pairs() if _pairs_file_exists() else {}
-        ids = set()
-        for p in pairs_cfg.get("pairs", []):
-            for k in ("source", "dest"):
-                if p.get(k):
-                    ids.add(int(p[k]))
-        for cid in ids:
-            try:
-                await _dl.client.get_input_entity(cid)
-            except Exception:
-                pass
-        print(f"[startup] entity warmup done — {len(ids)} pair channels resolved", file=sys.stderr)
-    except Exception as e:
-        print(f"[startup] pair entity warmup failed (non-fatal): {e}", file=sys.stderr)
+    if not _telegram_session_error:
+        try:
+            pairs_cfg = load_pairs() if _pairs_file_exists() else {}
+            ids = set()
+            for p in pairs_cfg.get("pairs", []):
+                for k in ("source", "dest"):
+                    if p.get(k):
+                        ids.add(int(p[k]))
+            for cid in ids:
+                try:
+                    await _dl.client.get_input_entity(cid)
+                except Exception:
+                    pass
+            print(f"[startup] entity warmup done — {len(ids)} pair channels resolved")
+        except Exception as e:
+            print(f"[startup] pair entity warmup failed (non-fatal): {e}", file=sys.stderr)
     _scheduler_task = asyncio.create_task(_scheduler_loop())
     if not DASH_PASS and not ALLOW_INSECURE_OPEN_DASH:
         print(

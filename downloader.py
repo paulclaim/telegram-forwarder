@@ -418,9 +418,11 @@ class TelegramDownloader:
         """Adaptive download/upload timeout based on file size.
 
         Adaptive download/upload timeout with separate profiles for small and
-        large files. Small/medium files keep the fast "stall" behavior (200 KiB/s
-        floor + 30s headroom, [60s, 1800s]). Large files (>=25 MiB) use a lower
-        100 KiB/s floor and a 3600s cap so a ~600MB video on a 100-200 KiB/s link
+        large files. OpenWrt logs from telegram-link-saver showed a healthy
+        2.7 MiB download reaching 2.5 MiB before the old 60s floor cancelled it;
+        retries then restarted from zero. Small/medium files therefore use a
+        50 KiB/s floor + 60s headroom, [180s, 1800s]. Large files (>=25 MiB) use a
+        lower 100 KiB/s floor and a 3600s cap so a ~600MB video on a 100-200 KiB/s link
         (OpenWrt to Telegram CDN) gets one full attempt to finish instead of
         false-timing-out at the 1800s boundary every cycle.
         """
@@ -428,7 +430,7 @@ class TelegramDownloader:
         large_threshold = 25 * 1024 * 1024
         if size >= large_threshold:
             return float(min(3600, max(600, size / (100 * 1024) + 60)))
-        return float(min(1800, max(60, size / (200 * 1024) + 30)))
+        return float(min(1800, max(180, size / (50 * 1024) + 60)))
 
     @staticmethod
     def _unlink_quiet(path) -> None:

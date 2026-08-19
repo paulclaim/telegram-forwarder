@@ -390,8 +390,8 @@ show_logs() {
 
 follow_logs() {
   step "实时日志（Ctrl-C 返回）"
-  [ "$DRY_RUN" -eq 1 ] && { printf 'ssh %s %s %q\n' "$SSH_OPTS" "$SSH_HOST" 'logread -f | grep -iE "tg-forwarder|scheduler|mode=|cycle|forwarded|error|exception|traceback"'; return 0; }
-  remote_exec 'logread -f | grep -iE "tg-forwarder|scheduler|mode=|cycle|forwarded|error|exception|traceback"'
+  [ "$DRY_RUN" -eq 1 ] && { printf 'ssh %s %s %q\n' "$SSH_OPTS" "$SSH_HOST" 'logread -f | grep -iE " (tg-forwarder|tg-forwarder-openwrt\.sh)\[[0-9]+\]:|procd:.*tg-forwarder"'; return 0; }
+  remote_exec 'logread -f | grep -iE " (tg-forwarder|tg-forwarder-openwrt\.sh)\[[0-9]+\]:|procd:.*tg-forwarder"'
 }
 
 backup_remote_state() {

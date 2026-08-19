@@ -296,6 +296,15 @@ TG_FORWARDER_SSH_OPTS="-o ConnectTimeout=8 -o Port=2222" ./manage-openwrt.sh --s
 下载后会验证 SHA-256 和归档完整性。
 其中可能包含 Telegram 会话和密码，请勿提交到 Git。
 
+OpenWrt 服务通过 `tg-forwarder-openwrt.sh` 启动。它会先等待默认 WAN 路由与 NTP 有效标记，再连接 Telegram；
+这样可避免设备重启、PPPoE 尚未拨通或系统时钟未校准时的高频重连。copy-mode 临时媒体固定写入
+`/root/tg-forwarder/temp/`，不会占用 `/tmp` 的 tmpfs。若系统没有 dnsmasqsec 的 NTP hotplug，门禁退化为
+合理 epoch 检查；紧急排障时可临时设置 `OPENWRT_SKIP_READY_CHECK=1`，正常运行不建议跳过。
+
+部署目录由远端 `.tg-forwarder-root` 标记保护。首次部署或识别到已有 `server.py` + `automate.py` 项目时会
+自动创建标记；陌生的非空目录、文件系统根目录以及包含 `.` / `..` / 空路径段的目标都会在
+`rsync --delete` 前被拒绝。
+
 `pairs.json` schema:
 
 ```json
@@ -449,7 +458,12 @@ The old Railway config (`railway.json` + a one-shot data backup) has been moved 
 | `FloodWaitError: A wait of N seconds is required` | You're being rate-limited. Increase `--delay` or wait it out. |
 | `Could not find the input entity for PeerChannel(channel_id=...)` | Either you're not a member of the source, or the ID is wrong. Run `list-chats` to confirm. |
 | First run hangs on phone number prompt | Run from a real terminal (not a non-interactive shell). |
+| `AUTH_KEY_DUPLICATED` / session used from different IPs | 该 session 文件已被 Telegram 作废。停止其他副本，重新登录生成只供当前服务使用的 session；不要在多个公网出口间复制同一个 session 文件。 |
 | Hyperlinks/bold/italics lost | Update to the latest version — `msg.entities` is now passed through on copy. |
+
+调度器检测到 `AuthKeyDuplicatedError`、`AuthKeyUnregisteredError` 或 `SessionRevokedError` 后，会保留 Web
+管理与 `/healthz`，但停止后续 Telegram 调度，避免每个周期重复失败。健康响应的
+`telegram_session_error` 会给出脱敏错误类型；安装新 session 后必须重启服务。
 
 ## License
 

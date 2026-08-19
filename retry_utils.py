@@ -39,6 +39,39 @@ _TRANSIENT_MARKERS = (
     "transport is closing",
 )
 
+_FATAL_SESSION_ERROR_NAMES = {
+    "AuthKeyDuplicatedError",
+    "AuthKeyUnregisteredError",
+    "SessionRevokedError",
+}
+_FATAL_SESSION_MARKERS = (
+    "auth_key_duplicated",
+    "authorization key (session file) was used under two different ip",
+    "auth key unregistered",
+    "session revoked",
+)
+
+
+def is_fatal_session_error(exc: BaseException) -> bool:
+    """Return True when reconnect/retry cannot repair the Telegram session.
+
+    Telethon may wrap RPC errors through ``__cause__``/``__context__``. Walk a
+    short chain and also keep message markers for version compatibility.
+    """
+    current: Optional[BaseException] = exc
+    visited: set[int] = set()
+    for _ in range(5):
+        if current is None or id(current) in visited:
+            break
+        visited.add(id(current))
+        if type(current).__name__ in _FATAL_SESSION_ERROR_NAMES:
+            return True
+        message = str(current).lower()
+        if any(marker in message for marker in _FATAL_SESSION_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
 
 def is_transient_error(exc: BaseException) -> bool:
     """Return True if *exc* looks like a temporary network / transport fault.

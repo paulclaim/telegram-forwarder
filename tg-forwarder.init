@@ -11,7 +11,7 @@ USE_PROCD=1
 # shellcheck disable=SC2034 # 由 /etc/rc.common 读取。
 START=99
 
-PYTHON="/usr/bin/python3"
+RUNNER_NAME="tg-forwarder-openwrt.sh"
 
 start_service() {
     config_load tg-forwarder
@@ -21,14 +21,19 @@ start_service() {
     config_get DASH_PASS main dash_pass ""
     config_get_bool ALLOW_INSECURE_OPEN_DASH main allow_insecure_open_dash "0"
     config_get TELEGRAM_PROXY_URL main telegram_proxy_url ""
+    RUNNER="$APP_DIR/$RUNNER_NAME"
 
     if [ -z "$DASH_PASS" ] && [ "$ALLOW_INSECURE_OPEN_DASH" != "1" ]; then
         logger -t tg-forwarder "拒绝启动：/etc/config/tg-forwarder 未设置 dash_pass"
         return 1
     fi
+    if [ ! -f "$RUNNER" ]; then
+        logger -t tg-forwarder "拒绝启动：缺少 $RUNNER"
+        return 1
+    fi
 
     procd_open_instance
-    procd_set_param command "$PYTHON" "$APP_DIR/server.py"
+    procd_set_param command "$RUNNER"
     procd_set_param env PORT="$PORT"
     procd_set_param env DASH_USER="$DASH_USER"
     procd_set_param env DASH_PASS="$DASH_PASS"
