@@ -224,6 +224,78 @@ cp pairs.example.json pairs.json
 python automate.py
 ```
 
+### macOS 管理 OpenWrt
+
+仓库内的 `manage-openwrt.sh` 提供了一个适合 Mac mini 终端使用的交互式管理菜单，
+可以直接完成状态检查、日志查看、代码部署、服务启停、首次初始化、SSH shell 和远程运行态备份。
+它复用了 `deploy-openwrt.sh` 的同步逻辑，并且不会覆盖远程的水印、配置和会话文件。
+
+```bash
+./manage-openwrt.sh
+```
+
+也可以直接执行动作，适合脚本或快捷命令：
+
+```bash
+./manage-openwrt.sh --status
+./manage-openwrt.sh --logs
+./manage-openwrt.sh --deploy --yes
+./manage-openwrt.sh --backup
+./manage-openwrt.sh --auth
+```
+
+首次部署建议使用向导。它会安装 OpenWrt 依赖、配置持久化 Web 认证、上传远程缺失的
+`config.json` / `pairs.json` / `tg_session.session`、同步代码，并在健康检查通过后启动服务：
+
+```bash
+./manage-openwrt.sh --init
+```
+
+Web 用户名和密码保存在 OpenWrt 的 `/etc/config/tg-forwarder`（权限 `600`）。服务在密码为空时默认拒绝启动，
+避免设备重启后管理界面意外变成无认证状态；通过 `--auth` 更新密码后，如果服务正在运行会自动重启使其生效。
+非交互式首次部署可以临时传入：
+
+```bash
+TG_FORWARDER_DASH_USER=admin \
+TG_FORWARDER_DASH_PASS='replace-with-a-strong-password' \
+./manage-openwrt.sh --init --yes
+```
+
+可选地为 Telegram 配置 SOCKS5 代理（`user` / `pass` 为占位凭据）：
+
+```bash
+uci set tg-forwarder.main.telegram_proxy_url='socks5://user:pass@127.0.0.1:7891'
+uci commit tg-forwarder
+chmod 600 /etc/config/tg-forwarder
+```
+
+不使用 UCI、直接从命令行启动时，也可使用同名环境变量：
+
+```bash
+TELEGRAM_PROXY_URL='socks5://user:pass@127.0.0.1:7891' python automate.py
+```
+
+默认目标是 SSH 别名 `openwrt`、远程目录 `/root/tg-forwarder`。如果 Mac mini 上的 SSH 配置使用了其他别名，
+可以通过参数覆盖，或复制 `openwrt-manager.conf.example` 到
+`~/.config/telegram-forwarder/openwrt-manager.conf`：
+
+```bash
+./manage-openwrt.sh --host my-openwrt --remote-dir /opt/tg-forwarder
+```
+
+自定义端口请使用同时兼容 SSH、SCP 和 rsync 的写法：
+
+```bash
+TG_FORWARDER_SSH_OPTS="-o ConnectTimeout=8 -o Port=2222" ./manage-openwrt.sh --status
+```
+
+`ProxyCommand` 等包含空格的复杂参数请放入 `~/.ssh/config`。
+
+首次使用前，请确认 Mac mini 已安装 `ssh`、`scp`、`rsync`，并且 `~/.ssh/config` 中已配置好 OpenWrt 的密钥登录。
+备份文件会写入 `backups/openwrt/tg-forwarder-<时间戳>.tar.gz`，其中也包含持久化的 OpenWrt UCI 服务配置，
+下载后会验证 SHA-256 和归档完整性。
+其中可能包含 Telegram 会话和密码，请勿提交到 Git。
+
 `pairs.json` schema:
 
 ```json

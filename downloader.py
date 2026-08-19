@@ -12,6 +12,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable
+from urllib.parse import unquote, urlsplit
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -44,6 +45,33 @@ if hasattr(sys.stderr, "reconfigure") and sys.stderr.encoding and sys.stderr.enc
     sys.stderr.reconfigure(encoding="utf-8")
 
 BASE_DIR = Path(__file__).parent
+
+
+def get_telegram_proxy() -> Optional[tuple]:
+    proxy_url = os.environ.get("TELEGRAM_PROXY_URL")
+    if not proxy_url:
+        return None
+
+    try:
+        parsed = urlsplit(proxy_url)
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise ValueError("Invalid TELEGRAM_PROXY_URL") from None
+
+    if scheme not in {"socks5", "socks5h", "socks4", "http"}:
+        raise ValueError("Unsupported TELEGRAM_PROXY_URL scheme")
+    if not host:
+        raise ValueError("TELEGRAM_PROXY_URL host is required")
+    if port is None:
+        raise ValueError("TELEGRAM_PROXY_URL port is required")
+
+    username = unquote(parsed.username) if parsed.username is not None else None
+    password = unquote(parsed.password) if parsed.password is not None else None
+    proxy_type = "socks5" if scheme in {"socks5", "socks5h"} else scheme
+    rdns = scheme in {"socks5", "socks5h"}
+    return proxy_type, host, port, rdns, username, password
 
 
 def load_config(config_path: str = None) -> dict:
@@ -153,6 +181,10 @@ class TelegramDownloader:
         # connection_retries=None → Telethon keeps retrying forever on flaky
         # links (OpenWrt WAN blips). Scheduler still does its own ensure_connect
         # with exponential backoff as a second line of defence.
+        client_kwargs = {}
+        proxy = get_telegram_proxy()
+        if proxy is not None:
+            client_kwargs["proxy"] = proxy
         self.client = TelegramClient(
             session,
             self.api_id,
@@ -162,6 +194,7 @@ class TelegramDownloader:
             auto_reconnect=True,
             request_retries=5,
             timeout=30,
+            **client_kwargs,
         )
         await self.client.start()
         me = await self.client.get_me()

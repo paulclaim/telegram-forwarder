@@ -7,28 +7,81 @@
 #   ./deploy-openwrt.sh --status       # 只看远程运行状态,不同步
 #   ./deploy-openwrt.sh --logs         # 只看远程日志
 #   ./deploy-openwrt.sh --init         # 首次部署(装依赖+装 init 脚本)
+#   ./deploy-openwrt.sh --service      # 只更新 procd 服务脚本/UCI 配置
 #
 # SSH 主机别名 openwrt,部署目录 /root/tg-forwarder。
+# 可通过 TG_FORWARDER_SSH_HOST / TG_FORWARDER_REMOTE_DIR / TG_FORWARDER_SSH_OPTS 覆盖。
 # 只同步代码,绝不覆盖远程的运行态文件(watermarks/pairs/message_map/run_log),
 # 避免把转存进度和水印清零。
 
 set -euo pipefail
 
-SSH_HOST="openwrt"
-REMOTE_DIR="/root/tg-forwarder"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+SSH_HOST="${TG_FORWARDER_SSH_HOST:-openwrt}"
+REMOTE_DIR="${TG_FORWARDER_REMOTE_DIR:-/root/tg-forwarder}"
+SSH_OPTS="${TG_FORWARDER_SSH_OPTS:--o ConnectTimeout=8}"
 INIT_SCRIPT="tg-forwarder.init"
+INIT_CONFIG="tg-forwarder.config"
 PY_DEPS="telethon quart hypercorn openpyxl"
+
+# 将选项解析为数组，避免通配符展开。含空格的 ProxyCommand 等复杂配置应写进 ~/.ssh/config。
+read -r -a SSH_ARGS <<< "$SSH_OPTS"
+printf -v RSYNC_SSH '%q ' ssh "${SSH_ARGS[@]}"
+RSYNC_SSH="${RSYNC_SSH% }"
+# shellcheck disable=SC2029 # 参数中的命令有意在 OpenWrt 端执行。
+ssh_run() { ssh "${SSH_ARGS[@]}" "$SSH_HOST" "$@"; }
+scp_run() { scp "${SSH_ARGS[@]}" "$@"; }
+
+case "$REMOTE_DIR" in
+  /*) ;;
+  *) echo "远程目录必须是绝对路径: $REMOTE_DIR" >&2; exit 1 ;;
+esac
+case "$REMOTE_DIR" in
+  *[!A-Za-z0-9_./-]*) echo "远程目录包含不支持的字符: $REMOTE_DIR" >&2; exit 1 ;;
+esac
 
 # ── 颜色 ────────────────────────────────────────────────────────
 if [ -t 1 ]; then
-  G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; B=$'\033[36m'; D=$'\033[2m'; N=$'\033[0m'
+  G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; B=$'\033[36m'; N=$'\033[0m'
 else
-  G=""; Y=""; R=""; B=""; D=""; N=""
+  G=""; Y=""; R=""; B=""; N=""
 fi
 log()  { echo "${G}✓${N} $*"; }
 warn() { echo "${Y}⚠${N} $*"; }
 err()  { echo "${R}✗${N} $*" >&2; }
 step() { echo "${B}▶${N} $*"; }
+
+install_service_files() {
+  step "更新 procd 服务脚本和持久配置"
+  if [ ! -f "$INIT_SCRIPT" ] || [ ! -f "$INIT_CONFIG" ]; then
+    err "缺少 $INIT_SCRIPT 或 $INIT_CONFIG"
+    return 1
+  fi
+  scp_run "$INIT_SCRIPT" "$SSH_HOST:/etc/init.d/tg-forwarder"
+  scp_run "$INIT_CONFIG" "$SSH_HOST:/tmp/tg-forwarder.config"
+  ssh_run "chmod +x /etc/init.d/tg-forwarder
+    if [ ! -f /etc/config/tg-forwarder ]; then
+      cp /tmp/tg-forwarder.config /etc/config/tg-forwarder
+      echo '已创建 /etc/config/tg-forwarder（启动前必须设置 dash_pass）'
+    else
+      echo '保留已有 /etc/config/tg-forwarder'
+    fi
+    rm -f /tmp/tg-forwarder.config
+    uci set 'tg-forwarder.main.app_dir=$REMOTE_DIR'
+    uci commit tg-forwarder
+    chmod 600 /etc/config/tg-forwarder
+    /etc/init.d/tg-forwarder enable"
+}
+
+remote_auth_is_safe() {
+  # shellcheck disable=SC2016 # UCI 值应在 OpenWrt 端读取。
+  ssh_run '
+    pass="$(uci -q get tg-forwarder.main.dash_pass 2>/dev/null || true)"
+    allow="$(uci -q get tg-forwarder.main.allow_insecure_open_dash 2>/dev/null || true)"
+    [ -n "$pass" ] || [ "$allow" = 1 ]'
+}
 
 ACTION="deploy"
 for arg in "$@"; do
@@ -37,6 +90,7 @@ for arg in "$@"; do
     --status)     ACTION="status" ;;
     --logs)       ACTION="logs" ;;
     --init)       ACTION="init" ;;
+    --service)    ACTION="service" ;;
     -h|--help)
       sed -n '2,12p' "$0"; exit 0 ;;
     *) err "未知参数: $arg"; exit 1 ;;
@@ -47,49 +101,75 @@ RESTART="${RESTART:-1}"
 # ── 只读动作 ─────────────────────────────────────────────────────
 if [ "$ACTION" = "status" ]; then
   step "远程运行状态"
-  ssh "$SSH_HOST" '/etc/init.d/tg-forwarder status 2>&1 | head -3
+  ssh_run '/etc/init.d/tg-forwarder status 2>&1 | head -3
                    echo "--- 进程 ---"; pgrep -af "server.py" || echo "(无进程)"
-                   echo "--- 健康检查 ---"; curl -s http://127.0.0.1:5000/healthz || echo "(无响应)"
-                   echo; echo "--- pairs.json ---"; cat '"$REMOTE_DIR"'/pairs.json'
+                   echo "--- 健康检查 ---"; curl -fsS --max-time 5 http://127.0.0.1:5000/healthz || echo "(无响应)"
+                   echo; echo "--- pairs.json ---"; if [ -f '"$REMOTE_DIR"'/pairs.json ]; then cat '"$REMOTE_DIR"'/pairs.json; else echo "(不存在)"; fi'
   exit $?
 fi
 
 if [ "$ACTION" = "logs" ]; then
   step "远程日志(最近 40 行)"
-  ssh "$SSH_HOST" 'logread | grep -iE "tg-forwarder|scheduler|mode=|cycle|forwarded" | tail -40'
+  ssh_run 'logread | grep -iE "tg-forwarder|scheduler|mode=|cycle|forwarded|error|exception|traceback" | tail -40'
   exit $?
 fi
 
 # ── 连通性检查 ───────────────────────────────────────────────────
 step "检查 SSH 连通性"
-if ! ssh -o ConnectTimeout=8 "$SSH_HOST" true 2>/dev/null; then
-  err "无法连接 $SSH_HOST —— 检查 ~/.ssh/config 里的 Host openwrt 配置"
+if ! ssh_run true 2>/dev/null; then
+  err "无法连接 $SSH_HOST —— 检查 SSH 配置、密钥和网络"
   exit 1
 fi
 log "SSH 连通"
 
+if [ "$ACTION" = "service" ]; then
+  install_service_files
+  log "procd 服务脚本已更新"
+  exit 0
+fi
+
 # ── 首次部署:装依赖 + 装 init 脚本 ──────────────────────────────
 if [ "$ACTION" = "init" ]; then
   step "首次部署:创建远程目录 + 安装系统依赖"
-  ssh "$SSH_HOST" "mkdir -p $REMOTE_DIR
-    apk update >/dev/null 2>&1 || true
-    apk add --no-cache rsync openssh-sftp-server 2>&1 | tail -3
+  ssh_run "mkdir -p $REMOTE_DIR
+    if command -v apk >/dev/null 2>&1; then
+      apk update >/dev/null 2>&1 || true
+      if ! apk add --no-cache python3 python3-pip rsync openssh-sftp-server >/tmp/tg-forwarder-pkg.log 2>&1; then
+        apk add --no-cache python3 py3-pip rsync openssh-sftp-server >/tmp/tg-forwarder-pkg.log 2>&1 || {
+          tail -20 /tmp/tg-forwarder-pkg.log; rm -f /tmp/tg-forwarder-pkg.log; exit 1;
+        }
+      fi
+      tail -8 /tmp/tg-forwarder-pkg.log
+      rm -f /tmp/tg-forwarder-pkg.log
+    elif command -v opkg >/dev/null 2>&1; then
+      opkg update >/dev/null 2>&1 || true
+      opkg install python3 python3-pip rsync openssh-sftp-server >/tmp/tg-forwarder-pkg.log 2>&1 || {
+        tail -20 /tmp/tg-forwarder-pkg.log; rm -f /tmp/tg-forwarder-pkg.log; exit 1;
+      }
+      tail -8 /tmp/tg-forwarder-pkg.log
+      rm -f /tmp/tg-forwarder-pkg.log
+    else
+      echo '未找到 apk 或 opkg，无法安装系统依赖' >&2
+      exit 1
+    fi
     echo '--- 安装 Python 依赖 ---'
-    python3 -m pip install --break-system-packages $PY_DEPS 2>&1 | tail -5
+    if python3 -m pip install --break-system-packages $PY_DEPS >/tmp/tg-forwarder-pip.log 2>&1; then
+      tail -8 /tmp/tg-forwarder-pip.log
+    else
+      tail -8 /tmp/tg-forwarder-pip.log
+      python3 -m pip install $PY_DEPS >/tmp/tg-forwarder-pip.log 2>&1 || {
+        tail -20 /tmp/tg-forwarder-pip.log
+        rm -f /tmp/tg-forwarder-pip.log
+        exit 1
+      }
+      tail -8 /tmp/tg-forwarder-pip.log
+    fi
+    rm -f /tmp/tg-forwarder-pip.log
     echo '--- 验证导入 ---'
     python3 -c 'import telethon,quart,hypercorn,openpyxl; print(\"deps OK\")' 2>&1"
 
-  step "传输 init 脚本并启用开机自启"
-  if [ ! -f "$INIT_SCRIPT" ]; then
-    err "找不到 $INIT_SCRIPT —— 它应该和本脚本在同一目录"
-    exit 1
-  fi
-  scp "$INIT_SCRIPT" "$SSH_HOST:/etc/init.d/tg-forwarder"
-  ssh "$SSH_HOST" "chmod +x /etc/init.d/tg-forwarder
-    mkdir -p /var/log
-    /etc/init.d/tg-forwarder enable
-    echo 'init 脚本已启用开机自启'"
-  log "首次部署完成。现在运行 ./deploy-openwrt.sh 同步代码,或手动 scp 会话/配置文件。"
+  install_service_files
+  log "系统初始化完成。请设置 dashboard 密码、同步代码和运行态文件后再启动服务。"
   exit 0
 fi
 
@@ -97,7 +177,7 @@ fi
 step "同步代码到 $SSH_HOST:$REMOTE_DIR"
 log "排除项: .venv .git .claude .spec-workflow __pycache__ *.pyc"
 log "排除项: 会话/配置/状态文件(保护远程运行态,不被覆盖)"
-rsync -avz --delete \
+RSYNC_RSH="$RSYNC_SSH" rsync -avz --delete \
   --exclude='.venv' --exclude='venv' \
   --exclude='.git' --exclude='.claude' --exclude='.spec-workflow' \
   --exclude='__pycache__' --exclude='*.pyc' --exclude='*.pyo' \
@@ -109,17 +189,34 @@ rsync -avz --delete \
   ./ "$SSH_HOST:$REMOTE_DIR/" 2>&1 | grep -vE '/$' | tail -20
 log "代码同步完成"
 
+# 每次部署都同步服务脚本；UCI 配置只在缺失时创建，已有密码不会被覆盖。
+install_service_files
+
 # ── 重启 ─────────────────────────────────────────────────────────
 if [ "$RESTART" = "1" ]; then
+  if ! remote_auth_is_safe >/dev/null 2>&1; then
+    err "远程未设置 dash_pass，拒绝重启以避免无认证管理界面。"
+    err "请先运行 ./manage-openwrt.sh --auth"
+    exit 1
+  fi
   step "重启服务以加载新代码"
-  ssh "$SSH_HOST" '/etc/init.d/tg-forwarder restart 2>&1
-    sleep 5
+  # shellcheck disable=SC2016 # 状态变量应由远程 ash 展开。
+  ssh_run '/etc/init.d/tg-forwarder restart 2>&1
+    ready=0; attempt=0
+    while [ "$attempt" -lt 20 ]; do
+      if curl -fsS --max-time 3 http://127.0.0.1:5000/healthz >/tmp/tg-forwarder-health 2>/dev/null; then
+        ready=1; break
+      fi
+      attempt=$((attempt + 1)); sleep 3
+    done
     echo "--- 状态 ---"
     /etc/init.d/tg-forwarder status 2>&1 | head -3
     echo "--- 健康检查 ---"
-    curl -s http://127.0.0.1:5000/healthz || echo "(服务还没起来,稍等再查)"
+    if [ "$ready" = 1 ]; then cat /tmp/tg-forwarder-health; else echo "(60 秒内未通过健康检查)"; fi
+    rm -f /tmp/tg-forwarder-health
     echo; echo "--- 启动日志 ---"
-    logread | grep -iE "server ready|cycle start|mode=" | tail -5'
+    logread | grep -iE "server ready|cycle start|mode=|error|exception|traceback" | tail -10
+    [ "$ready" = 1 ]'
   log "已重启,新代码生效"
 else
   warn "跳过重启(--no-restart)。改动需手动重启才生效:"

@@ -22,6 +22,7 @@ railway_backup_*/
 archive/
 secrets/
 SOP/
+backups/
 .DS_Store
 sources.json
 .claude/

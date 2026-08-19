@@ -1,0 +1,11 @@
+# 复制到 ~/.config/telegram-forwarder/openwrt-manager.conf 后按需修改。
+# 这里使用 SSH config 中的主机别名，不要把密码或私钥写入此文件。
+TG_FORWARDER_SSH_HOST=openwrt
+TG_FORWARDER_REMOTE_DIR=/root/tg-forwarder
+# 如需额外 SSH 选项，例如指定端口（使用可同时兼容 ssh/scp 的 -o Port）：
+# TG_FORWARDER_SSH_OPTS="-o ConnectTimeout=8 -o Port=22"
+# ProxyCommand 等包含空格的复杂参数请写入 ~/.ssh/config。
+
+# 非交互式首次部署时可临时通过环境变量提供，建议不要长期保存在此文件：
+# TG_FORWARDER_DASH_USER=admin
+# TG_FORWARDER_DASH_PASS=请替换为至少12位的强密码
