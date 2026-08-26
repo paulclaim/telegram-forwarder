@@ -59,11 +59,12 @@ docker run -d --name tg-forwarder -p 5000:8080 \
 ### OpenWrt
 
 ```bash
-./deploy-openwrt.sh            # rsync 代码到 openwrt:/root/tg-forwarder + 重启
-./deploy-openwrt.sh --init     # 首次：装依赖 + procd init
-./deploy-openwrt.sh --no-restart
-./deploy-openwrt.sh --status
-./deploy-openwrt.sh --logs
+./manage-openwrt.sh --deploy --yes  # rsync 代码到 openwrt:/root/tg-forwarder + 重启
+./manage-openwrt.sh --init          # 首次：装依赖 + procd init + 认证 + 运行态
+./manage-openwrt.sh --sync --yes
+./manage-openwrt.sh --status
+./manage-openwrt.sh --logs
+./manage-openwrt.sh --login         # 远程交互登录；备份旧 session 后成功才重启
 ```
 
 - SSH 别名 `openwrt`，远端 `/root/tg-forwarder`，服务 `/etc/init.d/tg-forwarder` → `python3 server.py`（PORT=5000）
@@ -190,7 +191,7 @@ Scheduler 间隔：`max(60, interval_seconds)`。
 - **禁止** 用空/本机 `watermarks.json` 覆盖生产卷 → 全量重转 + 目标重复
 - **禁止** 同一 data 目录并行两个进程（锁只在进程内）
 - **禁止** 提交 `config.json`、`*.session`、`.env`、真实 token（见 `.gitignore`）
-- 部署：`deploy-openwrt.sh` 已刻意不覆盖状态；手写 rsync/scp 时不要带上 watermark/session
+- 部署：`manage-openwrt.sh` 已刻意不覆盖状态；手写 rsync/scp 时不要带上 watermark/session
 - 新环境若历史已同步：种子 `INITIAL_WATERMARKS_JSON` 或 watermark repair，不要从 0 跑
 - `drop_author: true` 无 Premium 时实际无效；大 backlog 配 `max_per_run` + `delay_seconds`
 
