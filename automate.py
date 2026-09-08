@@ -535,6 +535,8 @@ async def enqueue_retry(
                     it["status"] = "pending"
                     it["attempts"] = 0
                     it["last_error"] = None
+                    it["last_attempt_at"] = None
+                    it.pop("next_attempt_at", None)
                 await _flush_retry_queue_locked(data)
                 return it
         item = {
@@ -581,12 +583,12 @@ async def remove_retry_items(item_ids: list[str]) -> int:
 
 
 def _retry_min_interval_seconds(pair_cfg: Optional[dict] = None) -> int:
-    """Min seconds between retry attempts for the same item (default 900 = 15min)."""
-    raw = (pair_cfg or {}).get("retry_min_interval_seconds", 900)
+    """Min seconds between retry attempts for the same item (default 30)."""
+    raw = (pair_cfg or {}).get("retry_min_interval_seconds", 30)
     try:
         return max(0, int(raw))
     except (TypeError, ValueError):
-        return 900
+        return 30
 
 
 def _retry_max_attempts(pair_cfg: Optional[dict] = None) -> int:
@@ -596,6 +598,25 @@ def _retry_max_attempts(pair_cfg: Optional[dict] = None) -> int:
         return int(raw)
     except (TypeError, ValueError):
         return 20
+
+
+def _retry_ready_at(item: dict, pair: dict) -> int:
+    """Persisted deadlines survive restarts; legacy items use adaptive backoff."""
+    base = _retry_min_interval_seconds(pair)
+    attempts = max(0, int(item.get("attempts") or 0))
+    delay = max(base, min(900, base * 2 ** min(10, max(0, attempts - 1))))
+    return max(
+        int(item.get("next_attempt_at") or 0),
+        int(item.get("last_attempt_at") or 0) + delay
+        if item.get("last_attempt_at") else 0,
+    )
+
+
+def _retry_is_due(item: dict, pair: dict, now: int, force: bool = False) -> bool:
+    # Manual force may bypass backoff, but never Telegram's required cooldown.
+    if now < int(item.get("flood_wait_until") or 0):
+        return False
+    return force or now >= _retry_ready_at(item, pair)
 
 
 async def drain_retry_queue(
@@ -628,7 +649,7 @@ async def drain_retry_queue(
 
     # Snapshot candidates outside the lock; mutate disk per-item under lock.
     candidates = []
-    for it in items:
+    for it in sorted(items, key=lambda x: int(x.get("last_attempt_at") or 0)):
         if it.get("status") not in (None, "pending"):
             continue
         if pair_name and it.get("pair") != pair_name:
@@ -638,9 +659,10 @@ async def drain_retry_queue(
             # Pair gone — keep item but don't try.
             skipped += 1
             continue
-        min_iv = _retry_min_interval_seconds(pair)
-        last_at = it.get("last_attempt_at") or 0
-        if not force and last_at and (now - int(last_at)) < min_iv:
+        if pair.get("paused") or _get_pair_lock(_pair_key(pair)).locked():
+            skipped += 1
+            continue
+        if not _retry_is_due(it, pair, now, force):
             skipped += 1
             continue
         candidates.append((it, pair))
@@ -681,6 +703,9 @@ async def drain_retry_queue(
                 data = load_retry_queue()
                 cur = next((x for x in data.get("items") or [] if x.get("id") == it["id"]), None)
                 if not cur or cur.get("status") not in (None, "pending"):
+                    skipped += 1
+                    continue
+                if not _retry_is_due(cur, pair, int(time.time()), force):
                     skipped += 1
                     continue
                 cur["attempts"] = int(cur.get("attempts") or 0) + 1
@@ -765,7 +790,17 @@ async def drain_retry_queue(
                     if cur:
                         cur["last_error"] = err_s[:500]
                         cur["updated_at"] = int(time.time())
-                        if (not transient) or (max_att > 0 and int(cur.get("attempts") or 0) >= max_att):
+                        if isinstance(e, FloodWaitError):
+                            cur["attempts"] = max(0, cur["attempts"] - 1)
+                            cur["flood_wait_until"] = cur["updated_at"] + e.seconds + 1
+                        cur["next_attempt_at"] = max(
+                            cur["updated_at"] + max(
+                                _retry_min_interval_seconds(pair),
+                                min(900, _retry_min_interval_seconds(pair) * 2 ** min(10, max(0, cur["attempts"] - 1))),
+                            ),
+                            int(cur.get("flood_wait_until") or 0),
+                        )
+                        if (not transient) or (not isinstance(e, FloodWaitError) and max_att > 0 and int(cur.get("attempts") or 0) >= max_att):
                             cur["status"] = "dead"
                             results.append({"id": it["id"], "src_id": src_id, "status": "dead",
                                             "error": err_s})

@@ -356,7 +356,7 @@ TG_FORWARDER_SSH_OPTS="-o ConnectTimeout=8 -o Port=2222" ./manage-openwrt.sh --s
 | `paused` | no | `false` | `true` makes the scheduler skip this pair. Manual `/api/pairs/<name>/run` still works. |
 | `max_file_size_mb` | no | `0` (unlimited) | Copy-mode only: skip messages whose media exceeds this cap **before** download. |
 | `transient_skip_after` | no | `3` | Consecutive transient failures on the **same** msg id before park-to-retry-queue + advance watermark. `0` = never auto-skip (retry forever). |
-| `retry_min_interval_seconds` | no | `900` | Min seconds between automatic re-attempts of a parked item (scheduler drain). |
+| `retry_min_interval_seconds` | no | `30` | Initial retry delay in seconds; doubles after failures up to 900s (never below the configured minimum). Scheduler checks every 30s, up to 20 items per pass. Telegram FloodWait deadlines also apply to forced retries and do not consume the failure budget. |
 | `retry_max_attempts` | no | `20` | Drain attempts before marking an item `dead` (stays in queue for manual review). `0` = unlimited. |
 | `replacements` | no | `[]` | List of `{find, replace, regex?}` rules. Forwards natively + edits caption after — does **not** force copy-mode. |
 

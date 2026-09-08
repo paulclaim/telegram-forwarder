@@ -1220,6 +1220,7 @@ async def _scheduler_loop():
     # Consecutive reconnect failures drive exponential backoff (30s → 10min).
     # Resets to 0 on a successful connect so brief blips don't accumulate.
     reconnect_fail_streak = 0
+    next_pair_run = 0.0
     while True:
         try:
             if _telegram_session_error:
@@ -1252,7 +1253,8 @@ async def _scheduler_loop():
                       f"{datetime.fromtimestamp(time.time() + interval, tz=timezone.utc).strftime('%H:%M:%S UTC')}")
             else:
                 print(f"[scheduler] cycle start — {len(active)} active pair(s), interval={interval}s")
-            for pair in pairs:
+            run_main_cycle = time.monotonic() >= next_pair_run
+            for pair in pairs if run_main_cycle else []:
                 if _paused:
                     break
                 # Per-pair pause: set `"paused": true` in pairs.json to keep a
@@ -1299,7 +1301,10 @@ async def _scheduler_loop():
                         )
                         break
 
-            # After the main pair cycle, drain a few parked retries so skipped
+            if run_main_cycle:
+                next_pair_run = time.monotonic() + interval
+
+            # During the main cycle waiting period, drain parked retries so skipped
             # media is eventually recovered without blocking watermarks.
             if not _paused and not fatal_session_detected and _dl:
                 try:
@@ -1320,7 +1325,7 @@ async def _scheduler_loop():
                             "job_id": rjob["id"],
                         })
                         rresult = await drain_retry_queue(
-                            _dl, max_items=3, force=False, job=rjob,
+                            _dl, max_items=20, force=False, job=rjob,
                         )
                         rjob["finished_at"] = int(time.time())
                         if rjob.get("status") == "running":
@@ -1341,9 +1346,10 @@ async def _scheduler_loop():
                             file=sys.stderr,
                         )
 
-            next_run = datetime.fromtimestamp(time.time() + interval, tz=timezone.utc).strftime('%H:%M:%S UTC')
-            print(f"[scheduler] cycle done — sleeping {interval}s, next run at {next_run}")
-            await asyncio.sleep(interval)
+            sleep_seconds = min(30, max(0, next_pair_run - time.monotonic()))
+            next_run = datetime.fromtimestamp(time.time() + sleep_seconds, tz=timezone.utc).strftime('%H:%M:%S UTC')
+            print(f"[scheduler] cycle done — sleeping {sleep_seconds:.0f}s, next run at {next_run}")
+            await asyncio.sleep(sleep_seconds)
         except asyncio.CancelledError:
             raise
         except Exception as e:
