@@ -250,6 +250,7 @@ async def forward_plan(
     job["ok"] = 0
     job["fail"] = 0
     BATCH = 100
+    remaining_batches = sum((len(msg_ids) + BATCH - 1) // BATCH for msg_ids in plan.values())
     for topic_id, msg_ids in plan.items():
         job[f"topic_{topic_id}_pending"] = len(msg_ids)
         for i in range(0, len(msg_ids), BATCH):
@@ -257,51 +258,43 @@ async def forward_plan(
                 job["status"] = "cancelled"
                 return
             batch_ids = msg_ids[i : i + BATCH]
-            # Fetch the actual Message objects (forward_batch needs them, not ids).
-            try:
-                batch_msgs = await dl.client.get_messages(source_id, ids=batch_ids)
-                batch_msgs = [m for m in batch_msgs if m is not None]
-            except FloodWaitError as fw:
-                await asyncio.sleep(fw.seconds + 1)
-                batch_msgs = await dl.client.get_messages(source_id, ids=batch_ids)
-                batch_msgs = [m for m in batch_msgs if m is not None]
-            if not batch_msgs:
-                job["fail"] += len(batch_ids)
-                job["done"] += len(batch_ids)
-                continue
+            remaining_batches -= 1
+            # forward_batch accepts ids directly. The plan already persisted
+            # exactly which source ids to send, so re-fetching Message objects
+            # here only added one Telegram RPC per 100 forwarded messages.
             top_msg = topic_id if topic_id and topic_id > 1 else None
             try:
                 forwarded = await dl.forward_batch(
-                    source_id, dest_id, batch_msgs,
+                    source_id, dest_id, batch_ids,
                     drop_author=drop_author, top_msg_id=top_msg,
                 )
             except FloodWaitError as fw:
                 await asyncio.sleep(fw.seconds + 1)
                 try:
                     forwarded = await dl.forward_batch(
-                        source_id, dest_id, batch_msgs,
+                        source_id, dest_id, batch_ids,
                         drop_author=drop_author, top_msg_id=top_msg,
                     )
                 except Exception as e:
                     print(f"[multi] topic {topic_id} batch failed post-flood: {e}")
-                    job["fail"] += len(batch_msgs)
-                    job["done"] += len(batch_msgs)
+                    job["fail"] += len(batch_ids)
+                    job["done"] += len(batch_ids)
                     continue
             except Exception as e:
                 print(f"[multi] topic {topic_id} batch failed: {e}")
-                job["fail"] += len(batch_msgs)
-                job["done"] += len(batch_msgs)
+                job["fail"] += len(batch_ids)
+                job["done"] += len(batch_ids)
                 continue
             # Record successes
             mappings: list[tuple[int, int]] = []
             log_rows: list[tuple] = []
             now = int(time.time())
-            for src_msg, fwd in zip(batch_msgs, forwarded):
+            for src_id, fwd in zip(batch_ids, forwarded):
                 if fwd is not None:
                     dst_id = getattr(fwd, "id", None)
                     if dst_id is not None:
-                        mappings.append((src_msg.id, dst_id))
-                        log_rows.append((src_msg.id, dst_id, topic_id, now))
+                        mappings.append((src_id, dst_id))
+                        log_rows.append((src_id, dst_id, topic_id, now))
                         job["ok"] += 1
                     else:
                         job["fail"] += 1
@@ -315,8 +308,10 @@ async def forward_plan(
                     "INSERT OR REPLACE INTO forward_log VALUES (?,?,?,?)", log_rows
                 )
                 conn.commit()
-            # Tiny breather between batches so we don't spike FloodWait.
-            await asyncio.sleep(inter_batch_delay)
+            # Tiny breather only BETWEEN batches so the completed job doesn't
+            # pay an unnecessary trailing delay.
+            if remaining_batches > 0 and inter_batch_delay > 0:
+                await asyncio.sleep(inter_batch_delay)
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────

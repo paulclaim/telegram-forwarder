@@ -855,6 +855,11 @@ def _copy_concurrency(pair: dict, dl: TelegramDownloader) -> int:
         return 1
 
 
+def _copy_ahead_window(concurrency: int) -> int:
+    """Maximum number of copy-mode messages allowed ahead of ordered upload."""
+    return max(2, int(concurrency) * 2)
+
+
 def _matches_type(msg, ftype: str, dl: TelegramDownloader) -> bool:
     # Telegram service messages ("user joined", "channel created", "pinned X",
     # etc.) cannot be forwarded — forward_messages errors out and copy-mode has
@@ -1403,10 +1408,20 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
     if job:
         job.update({"status": "running"})
 
-    print(f"[{name}] copy pipeline concurrency={concurrency} temp={run_temp_dir.name}")
+    ahead_window = _copy_ahead_window(concurrency)
+    print(
+        f"[{name}] copy pipeline concurrency={concurrency} "
+        f"ahead_window={ahead_window} temp={run_temp_dir.name}"
+    )
 
     download_sem = asyncio.Semaphore(concurrency)
     large_sem = asyncio.Semaphore(1)  # at most one >20MB download at a time
+    # Bound the whole producer→uploader window, not just active download tasks.
+    # Without this, fast downloads can finish and leave an unbounded number of
+    # media payloads in `ready` while the ordered uploader is slower (or sleeps
+    # between sends), consuming disk and retaining Message objects for the
+    # entire backlog.
+    pipeline_slots = asyncio.Semaphore(ahead_window)
     # Ordered handoff: producer fills slots by arrival order; uploader drains 0..n
     ready: dict[int, dict] = {}
     ready_event = asyncio.Event()
@@ -1431,6 +1446,21 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
         if getattr(m, "media", None):
             return " media"
         return ""
+
+    async def _acquire_pipeline_slot() -> bool:
+        """Wait for bounded download-ahead capacity, remaining abort-responsive."""
+        nonlocal cancelled
+        while True:
+            if aborted_transient or cancelled:
+                return False
+            if job and job.get("cancel"):
+                cancelled = True
+                return False
+            try:
+                await asyncio.wait_for(pipeline_slots.acquire(), timeout=0.5)
+                return True
+            except asyncio.TimeoutError:
+                continue
 
     async def _download_slot(slot: int, m) -> None:
         override = None
@@ -1470,6 +1500,10 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                     break
                 if not _matches_type(m, ftype, dl):
                     continue
+                if max_per_run and next_slot >= max_per_run:
+                    break
+                if not await _acquire_pipeline_slot():
+                    break
                 if lookup_dest_id(name, m.id) is not None:
                     # Already on dest (map hit). Emit a synthetic ordered slot so
                     # the uploader advances watermark past this id without I/O.
@@ -1480,8 +1514,6 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                         "error": None, "already_mapped": True,
                     }
                     ready_event.set()
-                    if max_per_run and next_slot >= max_per_run:
-                        break
                     continue
                 if max_size_bytes > 0:
                     sz = _msg_media_size_bytes(m)
@@ -1501,11 +1533,7 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                             "error": None, "skip_oversize": True,
                         }
                         ready_event.set()
-                        if max_per_run and next_slot >= max_per_run:
-                            break
                         continue
-                if max_per_run and next_slot >= max_per_run:
-                    break
                 slot = next_slot
                 next_slot += 1
                 print(f"[{name}] → dl {slot + 1} src#{m.id}{_media_kind(m)}", flush=True)
@@ -1555,6 +1583,11 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                     **extra,
                 })
 
+        def _finish_slot() -> None:
+            nonlocal next_upload_idx
+            next_upload_idx += 1
+            pipeline_slots.release()
+
         while True:
             if job and job.get("cancel"):
                 cancelled = True
@@ -1594,14 +1627,14 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                 last_ok_id = max(last_ok_id, m.id)
                 await _persist_wm_coalesced(cheap_write=False)
                 _job_progress()
-                next_upload_idx += 1
+                _finish_slot()
                 continue
 
             if item.get("already_mapped"):
                 last_ok_id = max(last_ok_id, m.id)
                 await _persist_wm_coalesced(every=_WM_MAPPED_FLUSH_EVERY, cheap_write=False)
                 _job_progress()
-                next_upload_idx += 1
+                _finish_slot()
                 continue
 
             async def _handle_transient(reason: BaseException | str) -> bool:
@@ -1735,7 +1768,7 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             _job_progress()
             if processed % 25 == 0:
                 print(f"[{name}] progress {processed} (ok={ok} fail={fail})", flush=True)
-            next_upload_idx += 1
+            _finish_slot()
             await asyncio.sleep(delay)
 
     try:

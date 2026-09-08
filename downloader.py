@@ -698,6 +698,9 @@ class TelegramDownloader:
 
         Unlike client.forward_messages(), this exposes top_msg_id so we can
         forward into a forum-topic destination without falling back to copy-mode.
+        ``msgs`` may contain Message objects or integer message ids. Accepting ids
+        lets callers that already have a persisted id plan avoid an otherwise
+        redundant get_messages() network round-trip before every forward batch.
         Returns a list of forwarded Message objects (same length as input,
         with None for any that the server didn't echo back in the Updates).
 
@@ -711,7 +714,7 @@ class TelegramDownloader:
         from telethon.tl.types import UpdateMessageID
         from_peer = await self.client.get_input_entity(source)
         to_peer = await self.client.get_input_entity(dest)
-        ids = [m.id for m in msgs]
+        ids = [int(m) if isinstance(m, int) else int(m.id) for m in msgs]
         random_ids = [random.getrandbits(63) for _ in ids]
         kwargs = {
             "from_peer": from_peer,
