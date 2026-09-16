@@ -72,6 +72,16 @@ _telegram_session_error: Optional[str] = None
 _run_log: list[dict] = []           # in-memory ring buffer
 _RUN_LOG_MAX = 500
 RUN_LOG_PATH = Path(os.environ.get("RUN_LOG_PATH", str(BASE_DIR / "run_log.json")))
+# Deferred run-log flush: _log_event fires per message during live-edit storms,
+# and serializing the full ring buffer + writing it per event both amplifies
+# flash writes (OpenWrt) and stalls the event loop (web UI + Telethon pings).
+# Coalesce like the message_map does: dirty counter + debounced async flush in
+# a worker thread. fsync=False already accepts losing the tail on a power cut,
+# so the delayed write adds no new durability risk.
+_run_log_dirty: int = 0
+_run_log_flush_task: Optional[asyncio.Task] = None
+_run_log_flush_lock = asyncio.Lock()
+_RUN_LOG_FLUSH_DELAY = 2.0
 
 # Job registry — live + recently-finished jobs. status: queued|running|finished|cancelled|error
 _jobs: dict[str, dict] = {}
@@ -113,15 +123,68 @@ def _new_job(kind: str, label: str, total: int = 0) -> dict:
 
 
 def _log_event(event: dict) -> None:
+    """Append to the in-memory ring buffer; disk write is debounced.
+
+    The buffer itself is the source of truth for /api/runs — the disk copy
+    only matters for restore-on-restart, so a 2s coalescing window is fine.
+    """
+    global _run_log_dirty
     event = {"ts": int(time.time()), **event}
     _run_log.append(event)
     if len(_run_log) > _RUN_LOG_MAX:
         del _run_log[: len(_run_log) - _RUN_LOG_MAX]
+    _run_log_dirty += 1
+    _schedule_run_log_flush()
+
+
+def _schedule_run_log_flush() -> None:
+    global _run_log_flush_task
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop — best-effort synchronous write.
+        _flush_run_log_sync()
+        return
+    if _run_log_flush_task is None or _run_log_flush_task.done():
+        _run_log_flush_task = asyncio.create_task(_flush_run_log_soon())
+
+
+async def _flush_run_log_soon() -> None:
+    await asyncio.sleep(_RUN_LOG_FLUSH_DELAY)
+    try:
+        async with _run_log_flush_lock:
+            await _flush_run_log_locked()
+    except Exception as e:
+        # Best-effort log persistence: keep serving, retry on the next event.
+        print(f"run-log flush failed: {e}", file=sys.stderr)
+
+
+async def _flush_run_log_locked() -> None:
+    """Caller must hold _run_log_flush_lock. Serialize + write in a worker
+    thread so a several-hundred-KB buffer never stalls the event loop; loop
+    again if events landed while the previous snapshot was being written."""
+    global _run_log_dirty
+    from automate import _atomic_write_json
+    while _run_log_dirty > 0:
+        _run_log_dirty = 0
+        data = list(_run_log[-_RUN_LOG_MAX:])
+        await asyncio.to_thread(
+            _atomic_write_json, RUN_LOG_PATH, data, fsync=False
+        )
+
+
+async def flush_run_log() -> None:
+    """Force pending run-log events to disk (end of runs / shutdown)."""
+    async with _run_log_flush_lock:
+        await _flush_run_log_locked()
+
+
+def _flush_run_log_sync() -> None:
+    global _run_log_dirty
     try:
         from automate import _atomic_write_json
-        # fsync=False: ring-buffer log, losing the tail on power-cut is fine —
-        # not worth stalling the event loop on slow flash for every event.
-        _atomic_write_json(RUN_LOG_PATH, _run_log[-_RUN_LOG_MAX:], fsync=False)
+        _atomic_write_json(RUN_LOG_PATH, list(_run_log[-_RUN_LOG_MAX:]), fsync=False)
+        _run_log_dirty = 0
     except Exception:
         pass
 
@@ -343,6 +406,7 @@ async def api_pairs_post():
         if body.get("interval_seconds"):
             cfg["interval_seconds"] = int(body["interval_seconds"])
         save_pairs(cfg)
+        _invalidate_pairs_source_cache()
     _log_event({"kind": "pair_saved", "pair": name, "action": action})
     return jsonify({"ok": True, "action": action, "pair": new_pair})
 
@@ -354,6 +418,7 @@ async def api_pair_delete(name: str):
         before = len(cfg.get("pairs", []))
         cfg["pairs"] = [p for p in cfg.get("pairs", []) if p.get("name") != name]
         save_pairs(cfg)
+        _invalidate_pairs_source_cache()
         removed = before - len(cfg["pairs"])
         # Don't delete watermark — keeping it means if you re-add the pair you don't re-forward history.
     _log_event({"kind": "pair_deleted", "pair": name, "removed": removed})
@@ -373,6 +438,7 @@ async def api_pair_pause(name: str):
             return jsonify({"error": f"pair '{name}' not found"}), 404
         pair["paused"] = paused
         save_pairs(cfg)
+        _invalidate_pairs_source_cache()
     _log_event({"kind": "pair_paused" if paused else "pair_unpaused", "pair": name})
     return jsonify({"ok": True, "pair": name, "paused": paused})
 
@@ -1128,6 +1194,7 @@ async def _clone_forum_impl(*, source_id: int, dest_title: str, skip_general: bo
             pairs_added.append(name)
 
         save_pairs(cfg)
+        _invalidate_pairs_source_cache()
 
     return {
         "dest_chat_id": dest_chat_id,
@@ -1366,15 +1433,35 @@ async def _scheduler_loop():
 # logged and swallowed so a single broken pair can't kill the dispatcher.
 
 
+# Short-TTL cache for _pairs_for_source: MessageEdited/MessageDeleted fire
+# once per source message, and reading pairs.json from disk on every event
+# stalls the event loop during edit/delete storms. TTL stays short so a
+# newly-added pair still picks up edits without a restart (design intent).
+_PAIRS_FOR_SOURCE_TTL = 10.0
+_pairs_for_source_cache: dict[int, tuple[float, list[dict]]] = {}
+
+
+def _invalidate_pairs_source_cache() -> None:
+    """Drop cached pair lookups after pairs.json mutations (pair CRUD)."""
+    _pairs_for_source_cache.clear()
+
+
 def _pairs_for_source(source_chat_id: int) -> list[dict]:
     """Return all configured pairs whose source matches this chat id.
-    Reads pairs.json each call so newly-added pairs pick up edits without
-    a restart. Cheap (file is small)."""
+    Cached for _PAIRS_FOR_SOURCE_TTL seconds; callers only read the returned
+    pair dicts, never mutate them."""
+    key = int(source_chat_id)
+    now = time.monotonic()
+    hit = _pairs_for_source_cache.get(key)
+    if hit is not None and now < hit[0]:
+        return hit[1]
     try:
         cfg = load_pairs() if _pairs_file_exists() else {"pairs": []}
     except Exception:
         return []
-    return [p for p in cfg.get("pairs", []) if int(p.get("source", 0)) == int(source_chat_id)]
+    pairs = [p for p in cfg.get("pairs", []) if int(p.get("source", 0)) == key]
+    _pairs_for_source_cache[key] = (now + _PAIRS_FOR_SOURCE_TTL, pairs)
+    return pairs
 
 
 async def _on_source_edited(event) -> None:
@@ -1530,6 +1617,10 @@ async def _shutdown():
         await flush_message_map()
     except Exception as e:
         print(f"[shutdown] flush_message_map failed: {e}", file=sys.stderr)
+    try:
+        await flush_run_log()
+    except Exception as e:
+        print(f"[shutdown] flush_run_log failed: {e}", file=sys.stderr)
     if _scheduler_task:
         _scheduler_task.cancel()
     if _dl:

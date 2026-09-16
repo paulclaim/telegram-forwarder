@@ -232,10 +232,14 @@ esac
         )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertLess(
+            result.stdout.index("检查远程二维码登录依赖"),
+            result.stdout.index("远程服务 stop"),
+        )
         self.assertIn("远程服务 stop", result.stdout)
         self.assertIn("确认转发进程已停止", result.stdout)
         self.assertIn("备份", result.stdout)
-        self.assertIn("python3 cli.py list-chats --limit 1", result.stdout)
+        self.assertIn("python3 cli.py login-qr", result.stdout)
         self.assertIn("远程服务 start", result.stdout)
         self.assertIn("telegram_session_error=null", result.stdout)
         self.assertIn("Telegram 登录完成", result.stdout)
@@ -252,7 +256,7 @@ esac
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("--login", result.stdout)
-        self.assertIn("重新登录 Telegram", result.stdout)
+        self.assertIn("扫码登录 Telegram", result.stdout)
 
     def test_login_transport_does_not_require_remote_base64_command(self) -> None:
         script = MANAGER_SCRIPT.read_text(encoding="utf-8")

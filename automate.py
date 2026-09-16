@@ -1081,11 +1081,9 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
         sid = highest_seen_id if scanned is None else scanned
         if cap_scanned_to_ok or not publish_scanned:
             sid = min(int(sid), int(last_ok_id))
-        state[name] = {
-            "last_msg_id": last_ok_id,
-            "updated_at": now,
-            "last_scanned_id": sid,
-        }
+        # save_pair_watermark re-loads state from disk and rebuilds the entry
+        # itself (preserving extra keys like transient_fail) — only the
+        # arguments below land on disk, so no in-memory state write is needed.
         await save_pair_watermark(
             name, last_ok_id, now, last_scanned_id=sid, fsync=durable,
         )
@@ -1633,11 +1631,7 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                     return
                 if producer_done and next_upload_idx >= next_slot:
                     return
-                if cancelled and next_upload_idx not in ready:
-                    # Drain any already-finished slots so temps get cleaned; stop
-                    # waiting forever for slots the producer abandoned.
-                    if producer_done:
-                        return
+
                 ready_event.clear()
                 if next_upload_idx in ready:
                     break

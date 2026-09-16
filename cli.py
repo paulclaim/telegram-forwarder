@@ -3,6 +3,7 @@
 Telegram Downloader CLI — Telethon version
 
 Usage:
+    py -3.11 cli.py login-qr
     py -3.11 cli.py list-chats
     py -3.11 cli.py list-topics --chat "-1002460585809"
     py -3.11 cli.py forward-topic --source "-1002460585809" --topic 1 --dest "-1003951264037"
@@ -13,9 +14,132 @@ Usage:
 
 import argparse
 import asyncio
+import getpass
+import os
 import sys
+import time
 
-from downloader import TelegramDownloader, load_config
+from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError
+
+from downloader import TelegramDownloader, get_telegram_proxy, load_config
+
+
+_CLEAR_TERMINAL = "\033[2J\033[3J\033[H"
+
+
+def _qr_timeout(value: str) -> int:
+    try:
+        seconds = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("必须是整数秒数") from exc
+    if not 60 <= seconds <= 900:
+        raise argparse.ArgumentTypeError("必须在 60 到 900 秒之间")
+    return seconds
+
+
+def _render_login_qr(login_url: str) -> None:
+    """Render a QR token without exposing its tg:// URL as terminal text."""
+    import qrcode
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=1,
+        border=4,
+    )
+    qr.add_data(login_url)
+    qr.make(fit=True)
+
+    print(_CLEAR_TERMINAL, end="")
+    print("请使用已登录的 Telegram 手机客户端扫码：")
+    print("设置 → 设备 → 链接桌面设备\n")
+    for row in qr.get_matrix():
+        # Explicit backgrounds stay scannable with both dark and light themes.
+        print(
+            "".join("\033[40m  " if cell else "\033[47m  " for cell in row)
+            + "\033[0m"
+        )
+    print("\033[0m\n二维码会在过期后自动刷新；按 Ctrl-C 取消。", flush=True)
+
+
+def _qr_wait_seconds(qr_login, overall_remaining: float) -> float:
+    expires_at = getattr(qr_login, "expires", None)
+    token_remaining = expires_at.timestamp() - time.time() if expires_at else 60.0
+    return max(1.0, min(overall_remaining, token_remaining))
+
+
+async def cmd_login_qr(args):
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise RuntimeError("二维码登录需要交互式终端")
+    if os.environ.get("TELETHON_SESSION_STRING"):
+        raise RuntimeError(
+            "二维码登录必须写入独立 session 文件；请先取消 TELETHON_SESSION_STRING"
+        )
+
+    config = load_config()
+    session_name = os.environ.get("TELETHON_SESSION_FILE", "tg_session")
+    session_path = str(os.path.join(os.path.dirname(__file__), session_name))
+    client_kwargs = {}
+    proxy = get_telegram_proxy()
+    if proxy is not None:
+        client_kwargs["proxy"] = proxy
+
+    client = TelegramClient(
+        session_path,
+        config["api_id"],
+        config["api_hash"],
+        connection_retries=3,
+        retry_delay=1,
+        timeout=30,
+        **client_kwargs,
+    )
+    await client.connect()
+    try:
+        if await client.is_user_authorized():
+            print("当前 session 已授权，无需重新扫码。")
+            return
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + args.timeout
+        qr_login = await client.qr_login()
+
+        while True:
+            overall_remaining = deadline - loop.time()
+            if overall_remaining <= 0:
+                raise RuntimeError(f"二维码登录在 {args.timeout} 秒内未完成")
+            wait_task = asyncio.create_task(
+                qr_login.wait(
+                    timeout=_qr_wait_seconds(qr_login, overall_remaining)
+                )
+            )
+            # QRLogin.wait() must register UpdateLoginToken before the QR can
+            # be scanned, otherwise a very fast scan can miss the event.
+            await asyncio.sleep(0)
+            _render_login_qr(qr_login.url)
+            try:
+                await wait_task
+                break
+            except asyncio.TimeoutError:
+                if deadline - loop.time() <= 0:
+                    raise RuntimeError(f"二维码登录在 {args.timeout} 秒内未完成")
+                await qr_login.recreate()
+            except SessionPasswordNeededError:
+                password = getpass.getpass("请输入 Telegram 两步验证密码（输入不显示）: ")
+                if not password:
+                    raise RuntimeError("两步验证密码不能为空")
+                try:
+                    await client.sign_in(password=password)
+                finally:
+                    password = ""
+                break
+
+        if not await client.is_user_authorized():
+            raise RuntimeError("扫码完成，但 Telegram 未确认当前 session 已授权")
+        print(_CLEAR_TERMINAL, end="")
+        print("✓ Telegram 扫码登录成功。")
+    finally:
+        await client.disconnect()
 
 
 def format_size(size_bytes: int) -> str:
@@ -175,6 +299,16 @@ def main():
     )
     sub = parser.add_subparsers(dest="command")
 
+    # login-qr
+    login_qr = sub.add_parser("login-qr", help="使用 Telegram 客户端扫码登录")
+    login_qr.add_argument(
+        "--timeout",
+        type=_qr_timeout,
+        default=300,
+        metavar="SECONDS",
+        help="等待扫码的总秒数（60-900，默认 300）",
+    )
+
     # list-chats
     lc = sub.add_parser("list-chats")
     lc.add_argument("--limit", type=int, default=50)
@@ -219,6 +353,7 @@ def main():
         sys.exit(1)
 
     commands = {
+        "login-qr": cmd_login_qr,
         "list-chats": cmd_list_chats,
         "list-topics": cmd_list_topics,
         "forward-topic": cmd_forward_topic,
@@ -226,7 +361,18 @@ def main():
         "export": cmd_export,
         "forward": cmd_forward,
     }
-    asyncio.run(commands[args.command](args))
+    try:
+        asyncio.run(commands[args.command](args))
+    except RuntimeError as exc:
+        if args.command != "login-qr":
+            raise
+        print(f"二维码登录失败：{exc}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        if args.command != "login-qr":
+            raise
+        print("\n二维码登录已取消。", file=sys.stderr)
+        sys.exit(130)
 
 
 if __name__ == "__main__":

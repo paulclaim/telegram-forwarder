@@ -17,7 +17,7 @@ CONFIG_FILE="${TG_FORWARDER_MANAGER_CONFIG:-${HOME:-/tmp}/.config/telegram-forwa
 SSH_HOST="${TG_FORWARDER_SSH_HOST:-openwrt}"
 REMOTE_DIR="${TG_FORWARDER_REMOTE_DIR:-/root/tg-forwarder}"
 SSH_OPTS="${TG_FORWARDER_SSH_OPTS:--o ConnectTimeout=8}"
-PY_DEPS="telethon quart hypercorn openpyxl"
+PY_DEPS="telethon quart hypercorn openpyxl qrcode"
 TARGET_MARKER=".tg-forwarder-root"
 RUNNER_SCRIPT="tg-forwarder-openwrt.sh"
 DRY_RUN=0
@@ -58,7 +58,7 @@ usage() {
   --sync                只同步代码，不重启
   --init                首次部署向导（依赖、认证、代码、运行态、启动）
   --auth                设置或更新持久化 Web 管理密码
-  --login               在 OpenWrt 上重新登录 Telegram（自动备份旧 session）
+  --login               在 OpenWrt 上扫码登录 Telegram（自动备份旧 session）
   --start / --stop      启动 / 停止服务
   --restart             重启服务
   --backup              备份远程配置、会话和运行态文件到 backups/openwrt/
@@ -385,7 +385,34 @@ install_system_dependencies() {
       tail -8 /tmp/tg-forwarder-pip.log
     fi
     rm -f /tmp/tg-forwarder-pip.log
-    python3 -c 'import telethon,quart,hypercorn,openpyxl; print(\"deps OK\")' 2>&1" || return 1
+    python3 -c 'import telethon,quart,hypercorn,openpyxl,qrcode; print(\"deps OK\")' 2>&1" || return 1
+}
+
+ensure_qr_login_dependency() {
+  step "检查远程二维码登录依赖"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '检查 %s 是否已安装 Python qrcode；缺失时先安装再停止服务\n' "$SSH_HOST"
+    return 0
+  fi
+  remote_exec '
+    if python3 -c "import qrcode" >/dev/null 2>&1; then
+      echo "qrcode 已安装"
+      exit 0
+    fi
+    echo "正在安装 qrcode..."
+    if python3 -m pip install --break-system-packages "qrcode>=7.4.2,<9" >/tmp/tg-forwarder-qrcode.log 2>&1 ||
+       python3 -m pip install "qrcode>=7.4.2,<9" >/tmp/tg-forwarder-qrcode.log 2>&1; then
+      rm -f /tmp/tg-forwarder-qrcode.log
+      python3 -c "import qrcode"
+      echo "qrcode 安装完成"
+    else
+      tail -20 /tmp/tg-forwarder-qrcode.log
+      rm -f /tmp/tg-forwarder-qrcode.log
+      exit 1
+    fi' || {
+      err "无法安装二维码登录依赖；转发服务尚未停止"
+      return 1
+    }
 }
 
 sync_code() {
@@ -747,12 +774,13 @@ telegram_login() {
   warn "新的 tg_session.session 只能供当前服务使用，不能复制给其他机器或服务。"
   confirm || return 0
   check_connection || return 1
+  ensure_qr_login_dependency || return 1
   service_action_internal stop || return 1
   ensure_forwarder_stopped_for_login || return 1
 
-  step "备份旧 Telegram session 并开始交互登录"
+  step "备份旧 Telegram session 并开始扫码登录"
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'ssh -t %s %s：备份 %s/tg_session.session，然后运行 python3 cli.py list-chats --limit 1\n' \
+    printf 'ssh -t %s %s：备份 %s/tg_session.session，然后运行 python3 cli.py login-qr\n' \
       "$SSH_OPTS" "$SSH_HOST" "$REMOTE_DIR"
   else
     login_script="$(cat <<'REMOTE_LOGIN_SCRIPT'
@@ -789,8 +817,9 @@ unset TELETHON_SESSION_STRING
 export TELETHON_SESSION_FILE=tg_session
 
 echo
-echo '请按提示输入手机号、Telegram 验证码和两步验证密码：'
-python3 cli.py list-chats --limit 1
+echo '请使用已登录的 Telegram 手机客户端扫描终端二维码。'
+echo '若账号启用了两步验证，扫码后仍需在终端输入密码。'
+python3 cli.py login-qr
 [ -f tg_session.session ] || {
   echo '登录命令结束，但没有生成 tg_session.session' >&2
   exit 3
@@ -800,8 +829,8 @@ echo 'Telegram 登录成功，新 session 已保存。'
 REMOTE_LOGIN_SCRIPT
 )"
     login_script_b64="$(printf '%s' "$login_script" | base64 | tr -d '\n')"
-    # 必须分配伪终端，否则 Telethon 无法询问手机号、验证码和两步验证密码。
-    # 脚本编码进命令行而不是占用 stdin，以便远程 Python 继续读取交互输入。
+    # 必须分配伪终端，以正确显示二维码并在需要时安全读取两步验证密码。
+    # 脚本编码进命令行而不是占用 stdin，以便远程 Python 保持交互输入。
     # shellcheck disable=SC2029 # 登录命令必须在 OpenWrt 端展开并交互执行。
     if ! ssh "${SSH_ARGS[@]}" -t "$SSH_HOST" "
       set -eu
@@ -978,7 +1007,7 @@ menu() {
  11) 打开 SSH shell
  12) 检查本机工具和 SSH
  13) 设置/更新 Web 管理密码
- 14) Telegram 重新登录（自动停服务并备份旧 session）
+ 14) Telegram 扫码登录（自动停服务并备份旧 session）
   0) 退出
 EOF
     printf '请选择 [0-14]: '
