@@ -166,17 +166,39 @@ async def _flush_run_log_locked() -> None:
     global _run_log_dirty
     from automate import _atomic_write_json
     while _run_log_dirty > 0:
-        _run_log_dirty = 0
+        pending = _run_log_dirty
         data = list(_run_log[-_RUN_LOG_MAX:])
         await asyncio.to_thread(
             _atomic_write_json, RUN_LOG_PATH, data, fsync=False
         )
+        # Only acknowledge events after the snapshot is safely replaced. If
+        # the write raises, keep all events dirty so shutdown or the next
+        # scheduled flush retries them. Events appended while to_thread was
+        # running remain dirty and are included by the next loop iteration.
+        _run_log_dirty = max(0, _run_log_dirty - pending)
 
 
 async def flush_run_log() -> None:
     """Force pending run-log events to disk (end of runs / shutdown)."""
     async with _run_log_flush_lock:
         await _flush_run_log_locked()
+
+
+async def _cancel_run_log_flush_task() -> None:
+    """Discard an obsolete debounce timer after an explicit shutdown flush."""
+    global _run_log_flush_task
+    task = _run_log_flush_task
+    if task is None or task is asyncio.current_task():
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if _run_log_flush_task is task:
+            _run_log_flush_task = None
 
 
 def _flush_run_log_sync() -> None:
@@ -1613,6 +1635,29 @@ async def _startup():
 
 @app.after_serving
 async def _shutdown():
+    global _scheduler_task
+    # Stop producers before the final flush. In particular, a scheduler task
+    # may log while handling cancellation; flushing first would lose that tail
+    # when the event loop closes before the debounce timer fires.
+    scheduler_task = _scheduler_task
+    if scheduler_task:
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            # A failed scheduler must not prevent state/log persistence during
+            # process teardown.
+            print(f"[shutdown] scheduler stop failed: {e}", file=sys.stderr)
+        finally:
+            if _scheduler_task is scheduler_task:
+                _scheduler_task = None
+    if _dl:
+        try:
+            await _dl.stop()
+        except Exception as e:
+            print(f"[shutdown] telegram stop failed: {e}", file=sys.stderr)
     try:
         await flush_message_map()
     except Exception as e:
@@ -1621,10 +1666,8 @@ async def _shutdown():
         await flush_run_log()
     except Exception as e:
         print(f"[shutdown] flush_run_log failed: {e}", file=sys.stderr)
-    if _scheduler_task:
-        _scheduler_task.cancel()
-    if _dl:
-        await _dl.stop()
+    finally:
+        await _cancel_run_log_flush_task()
 
 
 if __name__ == "__main__":
