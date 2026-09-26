@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import cli
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import AuthTokenExpiredError, SessionPasswordNeededError
 
 
 class TelegramQrLoginTests(unittest.IsolatedAsyncioTestCase):
@@ -91,6 +91,30 @@ class TelegramQrLoginTests(unittest.IsolatedAsyncioTestCase):
 
         qr_login.recreate.assert_awaited_once()
         self.assertEqual(render.call_count, 2)
+        client.disconnect.assert_awaited_once()
+
+    async def test_server_expired_token_is_refreshed_and_waited_again(self) -> None:
+        client = self._client()
+        qr_login = self._qr_login()
+        old_url = qr_login.url
+        new_url = "tg://login?token=refreshed-token"
+        qr_login.wait.side_effect = [AuthTokenExpiredError(request=None), mock.Mock()]
+
+        async def refresh_token() -> None:
+            qr_login.url = new_url
+            qr_login.expires = datetime.now(timezone.utc) + timedelta(minutes=1)
+
+        qr_login.recreate.side_effect = refresh_token
+
+        _constructor, render = await self._run(client, qr_login)
+
+        qr_login.recreate.assert_awaited_once()
+        self.assertEqual(qr_login.wait.await_count, 2)
+        self.assertEqual(
+            render.call_args_list,
+            [mock.call(old_url), mock.call(new_url)],
+        )
+        client.sign_in.assert_not_awaited()
         client.disconnect.assert_awaited_once()
 
     def test_rendered_qr_does_not_print_login_url(self) -> None:

@@ -122,8 +122,8 @@ async def cmd_login_qr(args):
                 break
             except (asyncio.TimeoutError, AuthTokenExpiredError):
                 # asyncio.TimeoutError: 本地等待超时，需要换新二维码；
-                # AuthTokenExpiredError: 二维码约 30 秒未被扫描后 Telegram 服务端
-                # 使 token 过期（ImportLoginTokenRequest 报错），同样必须 recreate。
+                # AuthTokenExpiredError: Telethon 收到扫码事件后再次请求登录
+                # token 时，服务端可能报告旧 token 已过期；同样必须 recreate。
                 if deadline - loop.time() <= 0:
                     raise RuntimeError(f"二维码登录在 {args.timeout} 秒内未完成")
                 await qr_login.recreate()
