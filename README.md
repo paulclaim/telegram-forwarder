@@ -244,12 +244,14 @@ python automate.py
 ./manage-openwrt.sh --backup
 ./manage-openwrt.sh --auth
 ./manage-openwrt.sh --login
+./manage-openwrt.sh --login-phone
 ```
 
-选择菜单中的“Telegram 扫码登录”或执行 `--login` 后，管理器会停止转发服务、在远程设备上把旧的
-`tg_session.session` 备份为 `tg_session.invalid-<时间戳>.session`，然后在终端显示限时二维码。使用
-已登录的 Telegram 手机客户端进入“设置 → 设备 → 链接桌面设备”扫码确认；若账号启用了两步验证，
-扫码后仍需在终端输入密码。只有登录成功并生成
+选择菜单中的“Telegram 扫码登录”或执行 `--login` 后，终端会显示限时二维码。使用已登录的
+Telegram 手机客户端进入“设置 → 设备 → 链接桌面设备”扫码确认。也可选择菜单中的
+“Telegram 手机号登录”或执行 `--login-phone`，按提示输入带国家区号的手机号和 Telegram 验证码。
+两种方式在账号启用两步验证时都需输入密码。管理器会先停止转发服务，并把远程设备上的旧
+`tg_session.session` 备份为 `tg_session.invalid-<时间戳>.session`。只有登录成功并生成
 新 session 后才会重新启动服务；登录失败时服务保持停止，避免继续使用失效会话。不同机器或服务即使
 使用同一个 Telegram 账号，也必须分别登录生成独立 session，不能复制共用同一个 `.session` 文件。
 

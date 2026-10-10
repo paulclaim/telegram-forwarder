@@ -59,6 +59,7 @@ usage() {
   --init                首次部署向导（依赖、认证、代码、运行态、启动）
   --auth                设置或更新持久化 Web 管理密码
   --login               在 OpenWrt 上扫码登录 Telegram（自动备份旧 session）
+  --login-phone         在 OpenWrt 上用手机号和验证码登录（自动备份旧 session）
   --start / --stop      启动 / 停止服务
   --restart             重启服务
   --backup              备份远程配置、会话和运行态文件到 backups/openwrt/
@@ -762,11 +763,16 @@ verify_telegram_login() {
 }
 
 telegram_login() {
-  local login_script login_script_b64
+  local login_mode="${1:-qr}" login_command login_option login_script login_script_b64
+  case "$login_mode" in
+    qr) login_command=login-qr; login_option=--login ;;
+    phone) login_command=login-phone; login_option=--login-phone ;;
+    *) err "未知 Telegram 登录方式：$login_mode"; return 1 ;;
+  esac
   require_command ssh
   require_command base64
   if [ "$DRY_RUN" -eq 0 ] && [ ! -t 0 ]; then
-    err "Telegram 登录需要交互式终端，请直接运行：$(basename "$0") --login"
+    err "Telegram 登录需要交互式终端，请直接运行：$(basename "$0") $login_option"
     return 1
   fi
 
@@ -774,19 +780,22 @@ telegram_login() {
   warn "新的 tg_session.session 只能供当前服务使用，不能复制给其他机器或服务。"
   confirm || return 0
   check_connection || return 1
-  ensure_qr_login_dependency || return 1
+  if [ "$login_mode" = qr ]; then
+    ensure_qr_login_dependency || return 1
+  fi
   service_action_internal stop || return 1
   ensure_forwarder_stopped_for_login || return 1
 
-  step "备份旧 Telegram session 并开始扫码登录"
+  step "备份旧 Telegram session 并开始 Telegram 登录"
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'ssh -t %s %s：备份 %s/tg_session.session，然后运行 python3 cli.py login-qr\n' \
-      "$SSH_OPTS" "$SSH_HOST" "$REMOTE_DIR"
+    printf 'ssh -t %s %s：备份 %s/tg_session.session，然后运行 python3 cli.py %s\n' \
+      "$SSH_OPTS" "$SSH_HOST" "$REMOTE_DIR" "$login_command"
   else
     login_script="$(cat <<'REMOTE_LOGIN_SCRIPT'
 set -eu
 
 app_dir=$1
+login_mode=$2
 cd "$app_dir"
 [ -f config.json ] || {
   echo "缺少 $app_dir/config.json，无法读取 Telegram api_id/api_hash" >&2
@@ -817,9 +826,18 @@ unset TELETHON_SESSION_STRING
 export TELETHON_SESSION_FILE=tg_session
 
 echo
-echo '请使用已登录的 Telegram 手机客户端扫描终端二维码。'
-echo '若账号启用了两步验证，扫码后仍需在终端输入密码。'
-python3 cli.py login-qr
+case "$login_mode" in
+  qr)
+    echo '请使用已登录的 Telegram 手机客户端扫描终端二维码。'
+    echo '若账号启用了两步验证，扫码后仍需在终端输入密码。'
+    python3 cli.py login-qr
+    ;;
+  phone)
+    echo '请按提示输入手机号、Telegram 验证码和两步验证密码。'
+    python3 cli.py login-phone
+    ;;
+  *) echo "未知 Telegram 登录方式：$login_mode" >&2; exit 2 ;;
+esac
 [ -f tg_session.session ] || {
   echo '登录命令结束，但没有生成 tg_session.session' >&2
   exit 3
@@ -829,7 +847,7 @@ echo 'Telegram 登录成功，新 session 已保存。'
 REMOTE_LOGIN_SCRIPT
 )"
     login_script_b64="$(printf '%s' "$login_script" | base64 | tr -d '\n')"
-    # 必须分配伪终端，以正确显示二维码并在需要时安全读取两步验证密码。
+    # 必须分配伪终端，以显示二维码或读取手机号、验证码和两步验证密码。
     # 脚本编码进命令行而不是占用 stdin，以便远程 Python 保持交互输入。
     # shellcheck disable=SC2029 # 登录命令必须在 OpenWrt 端展开并交互执行。
     if ! ssh "${SSH_ARGS[@]}" -t "$SSH_HOST" "
@@ -839,7 +857,7 @@ REMOTE_LOGIN_SCRIPT
       python3 -c 'import base64, pathlib, sys; pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(sys.argv[2]))' \
         \"\$remote_script\" '$login_script_b64'
       chmod 700 \"\$remote_script\"
-      \"\$remote_script\" '$REMOTE_DIR'
+      \"\$remote_script\" '$REMOTE_DIR' '$login_mode'
     "; then
       err "Telegram 登录失败；服务保持停止，请修正后重新选择登录。"
       return 1
@@ -1008,9 +1026,10 @@ menu() {
  12) 检查本机工具和 SSH
  13) 设置/更新 Web 管理密码
  14) Telegram 扫码登录（自动停服务并备份旧 session）
+ 15) Telegram 手机号登录（自动停服务并备份旧 session）
   0) 退出
 EOF
-    printf '请选择 [0-14]: '
+    printf '请选择 [0-15]: '
     read -r choice || exit 0
     case "$choice" in
       1) run_menu_action show_status; pause_screen ;;
@@ -1026,7 +1045,8 @@ EOF
       11) run_menu_action open_shell ;;
       12) run_menu_action check_all; pause_screen ;;
       13) run_menu_action configure_auth; pause_screen ;;
-      14) run_menu_action telegram_login; pause_screen ;;
+      14) run_menu_action telegram_login qr; pause_screen ;;
+      15) run_menu_action telegram_login phone; pause_screen ;;
       0) return 0 ;;
       *) warn "无效选项：$choice" ;;
     esac
@@ -1035,7 +1055,7 @@ EOF
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --status|--logs|--follow-logs|--deploy|--sync|--init|--auth|--login|--start|--stop|--restart|--backup|--shell|--check)
+    --status|--logs|--follow-logs|--deploy|--sync|--init|--auth|--login|--login-phone|--start|--stop|--restart|--backup|--shell|--check)
       ACTION="${1#--}"; shift ;;
     --print-runtime) ACTION="print-runtime"; shift ;;
     --menu) ACTION="menu"; shift ;;
@@ -1082,7 +1102,8 @@ case "$ACTION" in
   sync) run_deploy sync ;;
   init) initial_setup ;;
   auth) configure_auth ;;
-  login) telegram_login ;;
+  login) telegram_login qr ;;
+  login-phone) telegram_login phone ;;
   start|stop|restart) service_action "$ACTION" ;;
   backup) backup_remote_state ;;
   shell) open_shell ;;

@@ -257,6 +257,23 @@ esac
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("--login", result.stdout)
         self.assertIn("扫码登录 Telegram", result.stdout)
+        self.assertIn("--login-phone", result.stdout)
+
+    def test_phone_login_dry_run_uses_phone_command_without_qr_dependency(self) -> None:
+        result = subprocess.run(
+            [str(MANAGER_SCRIPT), "--login-phone", "--dry-run", "--yes"],
+            cwd=REPO_ROOT,
+            env=self._environment(self.temp_root / "remote-phone-login"),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("python3 cli.py login-phone", result.stdout)
+        self.assertNotIn("检查远程二维码登录依赖", result.stdout)
+        self.assertIn("远程服务 stop", result.stdout)
+        self.assertIn("远程服务 start", result.stdout)
 
     def test_login_transport_does_not_require_remote_base64_command(self) -> None:
         script = MANAGER_SCRIPT.read_text(encoding="utf-8")

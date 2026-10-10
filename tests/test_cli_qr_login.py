@@ -9,7 +9,13 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import cli
-from telethon.errors import AuthTokenExpiredError, SessionPasswordNeededError
+from telethon.errors import (
+    AuthTokenExpiredError,
+    FloodWaitError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    SessionPasswordNeededError,
+)
 
 
 class TelegramQrLoginTests(unittest.IsolatedAsyncioTestCase):
@@ -128,3 +134,112 @@ class TelegramQrLoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(login_url, rendered)
         self.assertNotIn("super-secret-token", rendered)
         self.assertIn("链接桌面设备", rendered)
+
+
+class TelegramPhoneLoginTests(unittest.IsolatedAsyncioTestCase):
+    async def _run(
+        self,
+        *,
+        getpass_values=("123456",),
+        sign_in_effects=(),
+        send_code_effects=(),
+    ):
+        client = mock.Mock()
+        client.connect = mock.AsyncMock()
+        client.disconnect = mock.AsyncMock()
+        client.is_user_authorized = mock.AsyncMock(side_effect=[False, True])
+        client.send_code_request = mock.AsyncMock(
+            return_value=mock.Mock(phone_code_hash="code-hash")
+        )
+        if send_code_effects:
+            client.send_code_request.side_effect = list(send_code_effects)
+        client.sign_in = mock.AsyncMock()
+        if sign_in_effects:
+            client.sign_in.side_effect = list(sign_in_effects)
+
+        with (
+            mock.patch.object(cli.sys.stdin, "isatty", return_value=True),
+            mock.patch.object(cli.sys.stdout, "isatty", return_value=True),
+            mock.patch.dict(
+                os.environ,
+                {"TELETHON_SESSION_FILE": "phone_test_session", "TELETHON_SESSION_STRING": ""},
+            ),
+            mock.patch.object(cli, "load_config", return_value={"api_id": 1, "api_hash": "hash"}),
+            mock.patch.object(cli, "get_telegram_proxy", return_value=None),
+            mock.patch.object(cli, "TelegramClient", return_value=client) as constructor,
+            mock.patch("builtins.input", return_value="+8613800000000"),
+            mock.patch.object(cli.getpass, "getpass", side_effect=list(getpass_values)),
+            mock.patch("builtins.print"),
+        ):
+            await cli.cmd_login_phone(argparse.Namespace())
+        return client, constructor
+
+    async def test_phone_code_authorizes_and_disconnects(self) -> None:
+        client, constructor = await self._run()
+
+        self.assertTrue(constructor.call_args.args[0].endswith("phone_test_session"))
+        client.send_code_request.assert_awaited_once_with("+8613800000000")
+        client.sign_in.assert_awaited_once_with(
+            phone="+8613800000000", code="123456", phone_code_hash="code-hash"
+        )
+        client.disconnect.assert_awaited_once()
+
+    async def test_phone_login_prompts_for_two_step_password(self) -> None:
+        client, _constructor = await self._run(
+            getpass_values=("123456", "secret-password"),
+            sign_in_effects=(SessionPasswordNeededError(request=None), None),
+        )
+
+        self.assertEqual(client.sign_in.await_count, 2)
+        self.assertEqual(
+            client.sign_in.await_args_list[-1], mock.call(password="secret-password")
+        )
+        client.disconnect.assert_awaited_once()
+
+    async def test_wrong_code_prompts_again_with_same_hash(self) -> None:
+        client, _constructor = await self._run(
+            getpass_values=("11111", "123456"),
+            sign_in_effects=(PhoneCodeInvalidError(request=None), None),
+        )
+
+        self.assertEqual(client.sign_in.await_count, 2)
+        self.assertEqual(
+            client.sign_in.await_args_list,
+            [
+                mock.call(phone="+8613800000000", code="11111", phone_code_hash="code-hash"),
+                mock.call(phone="+8613800000000", code="123456", phone_code_hash="code-hash"),
+            ],
+        )
+        client.disconnect.assert_awaited_once()
+
+    async def test_expired_code_requests_a_new_code(self) -> None:
+        client, _constructor = await self._run(
+            getpass_values=("00000", "123456"),
+            sign_in_effects=(PhoneCodeExpiredError(request=None), None),
+            send_code_effects=(
+                mock.Mock(phone_code_hash="code-hash"),
+                mock.Mock(phone_code_hash="new-hash"),
+            ),
+        )
+
+        self.assertEqual(client.send_code_request.await_count, 2)
+        self.assertEqual(
+            client.sign_in.await_args_list[-1],
+            mock.call(phone="+8613800000000", code="123456", phone_code_hash="new-hash"),
+        )
+        client.disconnect.assert_awaited_once()
+
+    async def test_repeated_wrong_code_fails_with_friendly_error(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            await self._run(
+                getpass_values=("1", "2", "3"),
+                sign_in_effects=[PhoneCodeInvalidError(request=None)] * 3,
+            )
+
+        self.assertIn("多次输入错误", str(ctx.exception))
+
+    async def test_flood_wait_on_code_request_is_reported_friendly(self) -> None:
+        with self.assertRaises(RuntimeError) as ctx:
+            await self._run(send_code_effects=(FloodWaitError(request=None, capture=37),))
+
+        self.assertIn("37 秒", str(ctx.exception))

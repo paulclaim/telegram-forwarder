@@ -4,6 +4,7 @@ Telegram Downloader CLI — Telethon version
 
 Usage:
     py -3.11 cli.py login-qr
+    py -3.11 cli.py login-phone
     py -3.11 cli.py list-chats
     py -3.11 cli.py list-topics --chat "-1002460585809"
     py -3.11 cli.py forward-topic --source "-1002460585809" --topic 1 --dest "-1003951264037"
@@ -20,7 +21,13 @@ import sys
 import time
 
 from telethon import TelegramClient
-from telethon.errors import AuthTokenExpiredError, SessionPasswordNeededError
+from telethon.errors import (
+    AuthTokenExpiredError,
+    FloodWaitError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    SessionPasswordNeededError,
+)
 
 from downloader import TelegramDownloader, get_telegram_proxy, load_config
 
@@ -69,12 +76,12 @@ def _qr_wait_seconds(qr_login, overall_remaining: float) -> float:
     return max(1.0, min(overall_remaining, token_remaining))
 
 
-async def cmd_login_qr(args):
+def _build_login_client(login_label: str):
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        raise RuntimeError("二维码登录需要交互式终端")
+        raise RuntimeError(f"{login_label}登录需要交互式终端")
     if os.environ.get("TELETHON_SESSION_STRING"):
         raise RuntimeError(
-            "二维码登录必须写入独立 session 文件；请先取消 TELETHON_SESSION_STRING"
+            f"{login_label}登录必须写入独立 session 文件；请先取消 TELETHON_SESSION_STRING"
         )
 
     config = load_config()
@@ -85,7 +92,7 @@ async def cmd_login_qr(args):
     if proxy is not None:
         client_kwargs["proxy"] = proxy
 
-    client = TelegramClient(
+    return TelegramClient(
         session_path,
         config["api_id"],
         config["api_hash"],
@@ -94,6 +101,18 @@ async def cmd_login_qr(args):
         timeout=30,
         **client_kwargs,
     )
+
+
+async def _send_login_code(client, phone: str):
+    try:
+        return await client.send_code_request(phone)
+    except FloodWaitError as exc:
+        wait_seconds = getattr(exc, "seconds", 0) or 0
+        raise RuntimeError(f"请求验证码过于频繁，请在 {wait_seconds} 秒后重试") from exc
+
+
+async def cmd_login_qr(args):
+    client = _build_login_client("二维码")
     await client.connect()
     try:
         if await client.is_user_authorized():
@@ -141,6 +160,60 @@ async def cmd_login_qr(args):
             raise RuntimeError("扫码完成，但 Telegram 未确认当前 session 已授权")
         print(_CLEAR_TERMINAL, end="")
         print("✓ Telegram 扫码登录成功。")
+    finally:
+        await client.disconnect()
+
+
+async def cmd_login_phone(args):
+    client = _build_login_client("手机号")
+    await client.connect()
+    try:
+        if await client.is_user_authorized():
+            print("当前 session 已授权，无需重新登录。")
+            return
+
+        phone = input("请输入手机号（含国家区号，如 +86...）：").strip()
+        if not phone:
+            raise RuntimeError("手机号不能为空")
+        sent_code = await _send_login_code(client, phone)
+        attempts_left = 3
+        while True:
+            code = getpass.getpass("请输入 Telegram 验证码（输入不显示）：").strip()
+            if not code:
+                raise RuntimeError("验证码不能为空")
+            attempts_left -= 1
+            try:
+                await client.sign_in(
+                    phone=phone, code=code, phone_code_hash=sent_code.phone_code_hash
+                )
+            except SessionPasswordNeededError:
+                password = getpass.getpass("请输入 Telegram 两步验证密码（输入不显示）：")
+                if not password:
+                    raise RuntimeError("两步验证密码不能为空")
+                try:
+                    await client.sign_in(password=password)
+                finally:
+                    password = ""
+                break
+            except PhoneCodeInvalidError:
+                if attempts_left <= 0:
+                    raise RuntimeError(
+                        "验证码多次输入错误；请重新运行 login-phone 获取新验证码"
+                    ) from None
+                print(f"验证码不正确，请重新输入（剩余 {attempts_left} 次）。")
+            except PhoneCodeExpiredError:
+                if attempts_left <= 0:
+                    raise RuntimeError(
+                        "验证码已过期；请重新运行 login-phone 获取新验证码"
+                    ) from None
+                print("验证码已过期，正在重新发送。")
+                sent_code = await _send_login_code(client, phone)
+            else:
+                break
+
+        if not await client.is_user_authorized():
+            raise RuntimeError("Telegram 未确认当前 session 已授权")
+        print("✓ Telegram 手机号登录成功。")
     finally:
         await client.disconnect()
 
@@ -312,6 +385,8 @@ def main():
         help="等待扫码的总秒数（60-900，默认 300）",
     )
 
+    sub.add_parser("login-phone", help="使用手机号、验证码和两步验证密码登录")
+
     # list-chats
     lc = sub.add_parser("list-chats")
     lc.add_argument("--limit", type=int, default=50)
@@ -357,6 +432,7 @@ def main():
 
     commands = {
         "login-qr": cmd_login_qr,
+        "login-phone": cmd_login_phone,
         "list-chats": cmd_list_chats,
         "list-topics": cmd_list_topics,
         "forward-topic": cmd_forward_topic,
@@ -367,14 +443,14 @@ def main():
     try:
         asyncio.run(commands[args.command](args))
     except RuntimeError as exc:
-        if args.command != "login-qr":
+        if args.command not in {"login-qr", "login-phone"}:
             raise
-        print(f"二维码登录失败：{exc}", file=sys.stderr)
+        print(f"Telegram 登录失败：{exc}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
-        if args.command != "login-qr":
+        if args.command not in {"login-qr", "login-phone"}:
             raise
-        print("\n二维码登录已取消。", file=sys.stderr)
+        print("\nTelegram 登录已取消。", file=sys.stderr)
         sys.exit(130)
 
 
