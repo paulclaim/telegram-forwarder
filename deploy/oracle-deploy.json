@@ -1,0 +1,8 @@
+{
+  "target": "/opt/tg-forwarder",
+  "service": "tg-forwarder.service",
+  "state_dir": "/var/lib/tg-forwarder-deploy",
+  "health_url": "http://127.0.0.1:5000/healthz",
+  "health_timeout": 90,
+  "extra_excludes": []
+}

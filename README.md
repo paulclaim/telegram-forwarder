@@ -4,6 +4,27 @@
 
 Works on protected (restrict-saving) channels via automatic copy-mode fallback. Self-hostable in a single Docker container, runs on a $5 VPS.
 
+## 当前部署环境
+
+本项目部署在用户的 Oracle Cloud VPS 上，`sanjose` 是该 VPS 的 SSH 主机别名。
+连接时使用 `ssh sanjose`，连接参数由本机 `~/.ssh/config` 解析。
+
+Oracle VPS 的管理入口为 `manage-oracle.sh`。脚本默认远程目录为 `/opt/tg-forwarder`、
+systemd 服务名为 `tg-forwarder.service`、运行用户为 `ubuntu`、Web 端口为 `5000`；
+这些是管理器默认值，排障或部署前应以本机 `~/.config/telegram-forwarder/oracle-manager.conf`
+和服务器实际配置为准。可通过以下命令查看状态与日志：
+
+```bash
+./manage-oracle.sh --status
+./manage-oracle.sh --logs
+```
+
+### GitHub Actions 自动部署
+
+推送到自己的 GitHub 仓库 `paulclaim/telegram-forwarder` 的 `main` 分支后，
+GitHub Actions 自动检查并部署到 `sanjose`。配置和操作说明见
+[Oracle Actions 部署说明](deploy/README.md)。服务器不再定时监控 GitHub。
+
 ## Why this exists
 
 Most existing Telegram forwarders (tgcf, telemirror, the small cloners) have at least one of these problems:
