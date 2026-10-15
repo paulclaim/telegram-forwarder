@@ -1671,5 +1671,8 @@ async def _shutdown():
 
 
 if __name__ == "__main__":
+    # 默认仍绑定所有网卡，保证容器部署（Dockerfile CMD）可被端口映射访问；
+    # systemd 部署通过 env 中的 HOST=127.0.0.1 收敛为仅回环。
+    host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host=host, port=port)
