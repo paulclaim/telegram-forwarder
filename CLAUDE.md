@@ -202,3 +202,10 @@ Scheduler 间隔：`max(60, interval_seconds)`。
 - General topic（id=1）无法 `reply_to` 过滤；clone-forum 默认 `skip_general=True`
 - Job cancel 在扫描/批间隙生效，**不能**打断进行中的单文件传输
 - 无单元测试框架；`scripts/test_*.py` 是业务/冒烟脚本，不是 pytest
+
+## 文档归属与环境边界规范（强制）
+
+- **通用工程资产定位**：本项目所有文档（`README.md`、`Dockerfile`、通用配置示例）必须保持高度通用性，便于向上游（upstream）同步或在任意独立环境部署。
+- **严禁宿主机私有信息倒灌**：严禁将本台宿主机（San Jose VPS）的私有信息（如生产反代域名 `tgforward.wipoorg.com`、宿主机内部生产路径 `/opt/tg-forwarder`、生产 session 与环境变量）提交至本项目仓库。
+- **宿主机专属运维分离**：若涉及本台 VPS 上的特化部署（如 Systemd 服务单元 `tg-forwarder.service`、Caddy 反代与 Basic Auth 认证、宿主机并发参数与回环端口调优记录），必须在根目录运维仓库 `github-sanjose/doc/11-service-tg-forwarder.md` 及故障记录中维护，严禁写入本项目仓库。
+
