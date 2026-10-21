@@ -67,6 +67,7 @@ See [CREDITS.md](CREDITS.md) for the inspiration we drew from tgcf (text replace
 - Native server-side `forward_messages` at 100/call with optional `drop_author=True` — fast and bandwidth-free. Also used when the destination is a forum topic (via raw `ForwardMessagesRequest` with `top_msg_id`). One-shot and topic forwards use the same mode selection (native when allowed).
 - Copy mode (download to temp + re-upload) — automatic fallback only when the source is protected (`noforwards=True`). Streams messages, download-ahead with up to 3 concurrent downloads, sequential upload for order + watermark safety. Adaptive transfer timeouts scale with file size.
 - Preserves text formatting, inline hyperlinks, and the original filename on documents.
+- Preserves media groups (albums): messages sharing a `grouped_id` are re-uploaded as ONE `sendMultiMedia` call, so a mirrored album keeps its grid layout instead of arriving as N separate posts. Native forwards never split a group across batches or across a failure split. Definitive album errors fall back to individual sends (layout lost, nothing skipped). Network errors abort the run without advancing the watermark; album retries reuse stable random IDs across scheduler cycles.
 
 **Backfill at scale**
 - Streaming iteration over `iter_messages(reverse=True, min_id=watermark)` — memory stays flat on arbitrarily large channels (native and copy).

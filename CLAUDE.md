@@ -95,7 +95,7 @@ templates/index.html ► Quart SPA
 2. `is_source_protected` → `noforwards` 则 **copy**，否则 **native**（解析失败**假定 protected**）
 3. `iter_messages(reverse=True, min_id=watermark[, reply_to=source_topic])` — 流式，不全量进内存
 4. **Native**：最多 100 条/批；失败二进制拆批；成功 `record_mappings`；有 `replacements` 则 `edit_message(..., parse_mode=None)`（不强制 copy）
-5. **Copy**：download-ahead（并发 1–3；>20MB 全局单槽）+ **顺序** upload；每成功一条才推进 watermark
+5. **Copy**：download-ahead（并发 1–3；>20MB 全局单槽）+ **顺序** upload；每成功一条才推进 watermark。相邻且 `grouped_id` 相同的消息合并成一个相册（`_collect_album` → `downloader._send_copy_album` = 一次 `sendMultiMedia`），确定失败则退回逐条上传；网络异常则中止本轮且不推进水位，相册 random_id 按源消息和目标确定性生成，跨轮次复用；相册成员各自 record_mappings + 推进 watermark
 6. 瞬时失败 → **不推进** watermark；同 msg 连续失败 ≥ `transient_skip_after`（默认 3）→ 入 `retry_queue` 并推进；永久 RPC 错误直接 skip+推进，**不入队**
 7. Scheduler 周期末 `drain_retry_queue(max_items=3)`
 
@@ -180,6 +180,7 @@ Scheduler 间隔：`max(60, interval_seconds)`。
 ## 改代码时注意
 
 - 转发主路径：`automate._run_pair_locked` + `downloader.forward_batch` / copy 上传
+- **相册（media group）必须整组发**：同一 `grouped_id` 的消息只能进同一次 `forwardMessages` / `sendMultiMedia`，否则目的端会变成 N 条独立消息。改 native 分批（`BATCH`、失败二分拆批）或 copy 上传流程时，不要从组中间切开；copy 侧 `_collect_album` 会提前 release pipeline slot，别改成发送后才 release（会让 producer 死锁）
 - 写 watermark / message_map / retry_queue 必须 **锁 + 原子 replace**；watermark **默认不可回退**
 - 瞬时 vs 永久：`retry_utils.is_transient_error`；**FloodWait 不是 transient**（调用方 sleep 后重试）
 - 不要为 replacements 强制走 copy

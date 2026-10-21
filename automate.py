@@ -23,7 +23,7 @@ from typing import Optional
 
 from telethon.errors import FloodWaitError, MessageNotModifiedError
 
-from downloader import TelegramDownloader, load_config
+from downloader import ALBUM_MAX_ITEMS, TelegramDownloader, load_config
 from retry_utils import ensure_connected, is_transient_error
 
 BASE_DIR = Path(__file__).parent
@@ -1269,7 +1269,22 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                     await _persist_wm()
                     i += 1
                     return False
+                # Never cut a media group in half: Telegram only keeps the
+                # album layout when every member goes out in the SAME
+                # forwardMessages call, so split on a group boundary (a single
+                # group is at most 10 messages, hence the hard fallback).
                 mid = len(msgs_batch) // 2
+                if getattr(msgs_batch[mid], "grouped_id", None) is not None:
+                    probe = mid
+                    while (
+                        probe > 0
+                        and getattr(msgs_batch[probe], "grouped_id", None) is not None
+                        and msgs_batch[probe].grouped_id
+                        == getattr(msgs_batch[probe - 1], "grouped_id", None)
+                    ):
+                        probe -= 1
+                    if probe > 0:
+                        mid = probe
                 print(
                     f"[{name}] batch of {len(msgs_batch)} failed: {err} — "
                     f"splitting into {mid}+{len(msgs_batch) - mid}"
@@ -1378,12 +1393,20 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                         last_ok_id = m.id
                         await _persist_wm_coalesced(every=_WM_MAPPED_FLUSH_EVERY, cheap_write=False)
                     continue
-                batch.append(m)
-                if len(batch) >= BATCH:
+                gid = getattr(m, "grouped_id", None)
+                boundary = batch and (
+                    gid is None or gid != getattr(batch[-1], "grouped_id", None)
+                )
+                # Reserve room for the entire incoming album (at most ten
+                # members). Flush BEFORE adding its first member, keeping
+                # every request within Telegram's 100-message limit.
+                reserve = ALBUM_MAX_ITEMS if gid is not None else 1
+                if boundary and len(batch) + reserve > BATCH:
                     await _flush_batch()
                     if max_per_run and i >= max_per_run:
                         break
                     await asyncio.sleep(delay)
+                batch.append(m)
             # Final partial batch.
             if batch and not (job and job.get("cancel")) and not aborted_transient:
                 await _flush_batch()
@@ -1621,6 +1644,233 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
             next_upload_idx += 1
             pipeline_slots.release()
 
+        def _drop_payload(payload) -> None:
+            if isinstance(payload, dict) and payload.get("kind") == "media":
+                dl._unlink_quiet(payload.get("temp_path"))
+
+        async def _handle_transient(reason, m, payload) -> bool:
+            """Count consecutive transient fails on this msg.
+
+            Returns True if we skipped + advanced (caller continues).
+            Returns False if we aborted the run (caller must stop).
+            """
+            nonlocal aborted_transient, fail, last_ok_id
+            fail += 1
+            _drop_payload(payload)
+            skip_after = _transient_skip_after(pair)
+            count = await record_transient_fail(name, m.id)
+            if skip_after > 0 and count >= skip_after:
+                print(
+                    f"[{name}] transient failure at src#{m.id} "
+                    f"{count}/{skip_after}: {reason} — skip after consecutive "
+                    f"failures (watermark advances past #{m.id})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                await enqueue_retry(
+                    pair, m,
+                    reason=f"copy transient x{count}: {reason}",
+                )
+                last_ok_id = max(last_ok_id, m.id)
+                await _persist_wm()
+                return True
+            aborted_transient = True
+            print(
+                f"[{name}] transient failure at src#{m.id} "
+                f"{count}/{skip_after or '∞'}: {reason} — "
+                f"aborting copy run (watermark stays at #{last_ok_id})",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+
+        async def _send_one(m, payload, override) -> bool:
+            """Upload one message. Returns False when the run must stop."""
+            nonlocal ok, fail, last_ok_id, aborted_transient
+            try:
+                sent = await dl._send_copy_payload(
+                    m, dest, payload,
+                    dest_topic=dest_topic, text_override=override,
+                )
+            except FloodWaitError as e:
+                print(f"[{name}] ✗ ul src#{m.id}: FloodWait {e.seconds}s", flush=True)
+                fail += 1
+                _drop_payload(payload)
+                aborted_transient = True
+                print(
+                    f"[{name}] FloodWait at src#{m.id} — aborting copy run "
+                    f"(watermark stays at #{last_ok_id})",
+                    file=sys.stderr, flush=True,
+                )
+                return False
+            except Exception as e:
+                print(f"[{name}] ✗ ul src#{m.id}: {e}", flush=True)
+                if is_transient_error(e):
+                    return await _handle_transient(e, m, payload)
+                _drop_payload(payload)
+                # Permanent upload error: skip + advance watermark.
+                fail += 1
+                last_ok_id = max(last_ok_id, m.id)
+                await _persist_wm()
+                return True
+            if sent and sent != "skipped_permanent":
+                ok += 1
+                dest_msg_id = getattr(sent, "id", None)
+                if dest_msg_id is not None:
+                    # Record the mapping BEFORE the (coalesced) watermark
+                    # write: map-first ordering means a crash can only leave
+                    # map-ahead-of-wm (harmless), never an uploaded msg
+                    # above the on-disk wm but missing from the map.
+                    await record_mappings(name, [(m.id, dest_msg_id)])
+                last_ok_id = m.id
+                await _persist_wm_coalesced()
+            elif sent is None and not aborted_transient:
+                # upload returned None after internal retries → treat as
+                # transient so the next cycle re-tries this message.
+                return await _handle_transient(
+                    "upload returned no result after retries", m, payload
+                )
+            return not aborted_transient
+
+        async def _collect_album(idx, first_item) -> list:
+            """Gather the consecutive slots belonging to one media group.
+
+            The producer allocates one slot per message, so an album is a run
+            of adjacent slots sharing ``grouped_id``. Waiting for the following
+            slots to finish downloading lets the whole group go out in ONE
+            sendMultiMedia call — the only way Telegram renders it as an album
+            instead of N separate posts.
+
+            Slots are popped and their pipeline capacity released as they join
+            the batch: the download-ahead window is smaller than an album, so
+            holding capacity until the send would deadlock the producer.
+            """
+            gid = getattr(first_item["msg"], "grouped_id", None)
+            if not gid:
+                return [(idx, first_item)]
+            batch = [(idx, first_item)]
+            j = idx + 1
+            while len(batch) < ALBUM_MAX_ITEMS:
+                if aborted_transient or cancelled:
+                    break
+                if j not in ready:
+                    if producer_done and j >= next_slot:
+                        break
+                    ready_event.clear()
+                    if j not in ready:
+                        try:
+                            await asyncio.wait_for(ready_event.wait(), timeout=0.5)
+                        except asyncio.TimeoutError:
+                            pass
+                    if j not in ready:
+                        if producer_done and j >= next_slot:
+                            break
+                        continue
+                nxt = ready[j]
+                if getattr(nxt["msg"], "grouped_id", None) != gid:
+                    break
+                if (nxt.get("already_mapped") or nxt.get("skip_oversize")
+                        or nxt.get("error") is not None
+                        or not isinstance(nxt.get("payload"), dict)
+                        or nxt["payload"].get("kind") != "media"):
+                    # Irregular slot — leave it (and the rest) to the normal
+                    # single-message path.
+                    break
+                ready.pop(j)
+                pipeline_slots.release()
+                batch.append((j, nxt))
+                j += 1
+            if len(batch) > 1:
+                # The first member was popped by the caller, which normally
+                # releases its slot at the end of the loop iteration. The album
+                # branch advances next_upload_idx itself, so release it here —
+                # otherwise every album would leak one pipeline slot and
+                # eventually stall the producer.
+                pipeline_slots.release()
+            return batch
+
+        async def _send_album(batch) -> bool:
+            """Send one media group as an album; falls back to single sends."""
+            nonlocal ok, fail, last_ok_id, aborted_transient
+            entries = [
+                {"msg": it["msg"], "payload": it["payload"],
+                 "text_override": it["override"]}
+                for _, it in batch
+            ]
+            try:
+                sents = await dl._send_copy_album(entries, dest, dest_topic=dest_topic)
+            except FloodWaitError as e:
+                fail += 1
+                for _, it in batch:
+                    _drop_payload(it["payload"])
+                aborted_transient = True
+                print(
+                    f"[{name}] FloodWait {e.seconds}s on album x{len(batch)} — "
+                    f"aborting copy run (watermark stays at #{last_ok_id})",
+                    file=sys.stderr, flush=True,
+                )
+                return False
+            except Exception as e:
+                if aborted_transient or cancelled:
+                    for _, it in batch:
+                        _drop_payload(it["payload"])
+                    return False
+                if is_transient_error(e):
+                    # The server may have accepted sendMultiMedia before the
+                    # response was lost. Never switch to fresh single sends.
+                    fail += 1
+                    aborted_transient = True
+                    for _, it in batch:
+                        _drop_payload(it["payload"])
+                    print(
+                        f"[{name}] album result uncertain: {e} — aborting "
+                        f"(watermark stays at #{last_ok_id})",
+                        file=sys.stderr, flush=True,
+                    )
+                    return False
+                # The album layout is a nicety — never trade correctness for
+                # it. Re-send each member through the proven single path.
+                print(
+                    f"[{name}] ✗ album x{len(batch)} failed: "
+                    f"{type(e).__name__}: {e} — falling back to single sends",
+                    flush=True,
+                )
+                for _, it in batch:
+                    if not await _send_one(it["msg"], it["payload"], it["override"]):
+                        return False
+                return True
+
+            sents = list(sents or [])
+            if len(sents) < len(batch):
+                sents += [None] * (len(batch) - len(sents))
+            for (_, it), sent in zip(batch, sents):
+                m = it["msg"]
+                payload = it["payload"]
+                _drop_payload(payload)
+                if sent is None:
+                    print(
+                        f"[{name}] album member src#{m.id} returned no dest id "
+                        f"— will retry",
+                        file=sys.stderr,
+                    )
+                    if not await _handle_transient(
+                        "album upload returned no dest id", m, payload
+                    ):
+                        return False
+                    continue
+                ok += 1
+                dest_msg_id = getattr(sent, "id", None)
+                if dest_msg_id is not None:
+                    await record_mappings(name, [(m.id, dest_msg_id)])
+                last_ok_id = m.id
+            await _persist_wm_coalesced()
+            print(
+                f"[{name}] ↥ album x{len(batch)} "
+                f"src#{batch[0][1]['msg'].id}-#{batch[-1][1]['msg'].id}",
+                flush=True,
+            )
+            return True
+
         while True:
             if job and job.get("cancel"):
                 cancelled = True
@@ -1666,43 +1916,6 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                 _finish_slot()
                 continue
 
-            async def _handle_transient(reason: BaseException | str) -> bool:
-                """Count consecutive transient fails on this msg.
-
-                Returns True if we skipped + advanced (caller continues).
-                Returns False if we aborted the run (caller must stop).
-                """
-                nonlocal aborted_transient, fail, last_ok_id
-                fail += 1
-                if isinstance(payload, dict) and payload.get("kind") == "media":
-                    dl._unlink_quiet(payload.get("temp_path"))
-                skip_after = _transient_skip_after(pair)
-                count = await record_transient_fail(name, m.id)
-                if skip_after > 0 and count >= skip_after:
-                    print(
-                        f"[{name}] transient failure at src#{m.id} "
-                        f"{count}/{skip_after}: {reason} — skip after consecutive "
-                        f"failures (watermark advances past #{m.id})",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    await enqueue_retry(
-                        pair, m,
-                        reason=f"copy transient x{count}: {reason}",
-                    )
-                    last_ok_id = max(last_ok_id, m.id)
-                    await _persist_wm()
-                    return True
-                aborted_transient = True
-                print(
-                    f"[{name}] transient failure at src#{m.id} "
-                    f"{count}/{skip_after or '∞'}: {reason} — "
-                    f"aborting copy run (watermark stays at #{last_ok_id})",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                return False
-
             if err is not None:
                 print(f"[{name}] ✗ dl src#{m.id}: {err}", flush=True)
                 if isinstance(err, FloodWaitError):
@@ -1720,7 +1933,7 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                     _job_progress(status="error", error="flood wait abort")
                     return
                 if is_transient_error(err):
-                    if not await _handle_transient(err):
+                    if not await _handle_transient(err, m, payload):
                         _job_progress(status="error", error="transient network abort")
                         return
                     # skipped — fall through to advance next_upload_idx
@@ -1735,60 +1948,46 @@ async def _run_pair_locked(dl: TelegramDownloader, pair: dict, state: dict, job:
                 # as transient so the next cycle re-tries this message (until
                 # transient_skip_after is hit). FloodWait exhaustion re-raises
                 # and is handled via the err path above.
-                if not await _handle_transient("download returned no payload after retries"):
+                if not await _handle_transient(
+                    "download returned no payload after retries", m, payload
+                ):
                     _job_progress(status="error", error="transient network abort")
                     return
             else:
-                try:
-                    sent = await dl._send_copy_payload(
-                        m, dest, payload,
-                        dest_topic=dest_topic, text_override=override,
-                    )
-                except FloodWaitError as e:
-                    print(f"[{name}] ✗ ul src#{m.id}: FloodWait {e.seconds}s", flush=True)
-                    fail += 1
-                    if isinstance(payload, dict) and payload.get("kind") == "media":
-                        dl._unlink_quiet(payload.get("temp_path"))
-                    aborted_transient = True
-                    print(
-                        f"[{name}] FloodWait at src#{m.id} — aborting copy run "
-                        f"(watermark stays at #{last_ok_id})",
-                        file=sys.stderr, flush=True,
-                    )
-                    _job_progress(status="error", error="flood wait abort")
-                    return
-                except Exception as e:
-                    print(f"[{name}] ✗ ul src#{m.id}: {e}", flush=True)
-                    if is_transient_error(e):
-                        if not await _handle_transient(e):
-                            _job_progress(status="error", error="transient network abort")
-                            return
-                        sent = "skipped_permanent"
-                    else:
-                        if isinstance(payload, dict) and payload.get("kind") == "media":
-                            dl._unlink_quiet(payload.get("temp_path"))
-                        # Permanent upload error: skip + advance watermark.
-                        fail += 1
-                        last_ok_id = max(last_ok_id, m.id)
-                        await _persist_wm()
-                        sent = "skipped_permanent"
-                if sent and sent != "skipped_permanent":
-                    ok += 1
-                    dest_msg_id = getattr(sent, "id", None)
-                    if dest_msg_id is not None:
-                        # Record the mapping BEFORE the (coalesced) watermark
-                        # write: map-first ordering means a crash can only leave
-                        # map-ahead-of-wm (harmless), never an uploaded msg
-                        # above the on-disk wm but missing from the map.
-                        await record_mappings(name, [(m.id, dest_msg_id)])
-                    last_ok_id = m.id
-                    await _persist_wm_coalesced()
-                elif sent is None and not aborted_transient:
-                    # upload returned None after internal retries → treat as
-                    # transient so the next cycle re-tries this message.
-                    if not await _handle_transient("upload returned no result after retries"):
-                        _job_progress(status="error", error="transient network abort")
+                # Media group (album): the source posts it as N consecutive
+                # messages sharing grouped_id. Uploading them one at a time is
+                # exactly what made the mirror show N separate posts instead of
+                # the original grid — so collect the whole group and re-send it
+                # in ONE sendMultiMedia call.
+                album = None
+                if (getattr(m, "grouped_id", None)
+                        and isinstance(payload, dict)
+                        and payload.get("kind") == "media"):
+                    album = await _collect_album(next_upload_idx, item)
+                if album and len(album) > 1:
+                    if aborted_transient or cancelled:
+                        # Run is stopping (network abort / cancel) — do not
+                        # push a partial group; the next cycle re-walks it.
+                        for _, it in album:
+                            _drop_payload(it["payload"])
                         return
+                    if not await _send_album(album):
+                        _job_progress(status="error", error="album upload abort")
+                        return
+                    consumed = len(album)
+                    processed += consumed - 1
+                    next_upload_idx += consumed  # slots were released on collect
+                    _job_progress()
+                    if processed % 25 == 0:
+                        print(
+                            f"[{name}] progress {processed} (ok={ok} fail={fail})",
+                            flush=True,
+                        )
+                    await asyncio.sleep(delay)
+                    continue
+                if not await _send_one(m, payload, override):
+                    _job_progress(status="error", error="transient network abort")
+                    return
 
             if aborted_transient:
                 _job_progress(status="error", error="transient network abort")

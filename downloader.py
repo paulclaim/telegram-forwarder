@@ -15,9 +15,29 @@ from typing import Optional, Callable
 from urllib.parse import unquote, urlsplit
 
 from telethon import TelegramClient
+from telethon import utils as tl_utils
 from telethon.sessions import StringSession
-from telethon.tl.functions.messages import GetForumTopicsRequest, ForwardMessagesRequest
-from telethon.tl.types import ForumTopic, MessageMediaWebPage, DocumentAttributeFilename, DocumentAttributeVideo, DocumentAttributeSticker, DocumentAttributeAnimated, UpdateNewChannelMessage, UpdateNewMessage
+from telethon.tl.functions.messages import (
+    GetForumTopicsRequest,
+    ForwardMessagesRequest,
+    SendMultiMediaRequest,
+    UploadMediaRequest,
+)
+from telethon.tl.types import (
+    ForumTopic,
+    MessageMediaWebPage,
+    DocumentAttributeFilename,
+    DocumentAttributeVideo,
+    DocumentAttributeSticker,
+    DocumentAttributeAnimated,
+    InputMediaUploadedDocument,
+    InputMediaUploadedPhoto,
+    InputReplyToMessage,
+    InputSingleMedia,
+    UpdateMessageID,
+    UpdateNewChannelMessage,
+    UpdateNewMessage,
+)
 from telethon.errors import FloodWaitError
 
 from retry_utils import is_transient_error, sleep_backoff
@@ -45,6 +65,20 @@ if hasattr(sys.stderr, "reconfigure") and sys.stderr.encoding and sys.stderr.enc
     sys.stderr.reconfigure(encoding="utf-8")
 
 BASE_DIR = Path(__file__).parent
+
+# Telegram caps one media group (album) at 10 items; longer groups must be
+# chunked into several albums. Source albums never exceed 10, but the cap is
+# enforced defensively wherever groups are assembled.
+ALBUM_MAX_ITEMS = 10
+
+
+class _IdStub:
+    """Minimal Message stand-in for ids echoed only through UpdateMessageID."""
+
+    __slots__ = ("id",)
+
+    def __init__(self, mid: int):
+        self.id = mid
 
 
 def get_telegram_proxy() -> Optional[tuple]:
@@ -555,6 +589,62 @@ class TelegramDownloader:
             "is_video_document": is_video_document,
         }
 
+    def _copy_send_spec(self, msg, payload: dict,
+                        text_override: Optional[str] = None) -> dict:
+        """Describe how one copy-mode payload must be uploaded.
+
+        Shared by the single-message sender and the album sender so both keep
+        the source's original filename, video metadata and sticker type.
+
+        Why the attributes matter: if a video (document with video MIME or
+        DocumentAttributeVideo) is uploaded with force_document=True it renders
+        as a plain file download with no player; stickers uploaded without their
+        DocumentAttributeSticker render as raw .webp/.webm/.tgs files.
+        """
+        use_override = text_override is not None
+        original_name = payload.get("original_name")
+        video_attr = payload.get("video_attr")
+        sticker_attr = payload.get("sticker_attr")
+        animated_attr = payload.get("animated_attr")
+        is_video_document = bool(payload.get("is_video_document"))
+        is_sticker = sticker_attr is not None
+        attributes = []
+        if original_name and not is_sticker:
+            attributes.append(DocumentAttributeFilename(original_name))
+        if video_attr and not is_sticker:
+            attributes.append(video_attr)
+        if is_sticker:
+            if animated_attr:
+                attributes.append(animated_attr)
+            attributes.append(sticker_attr)
+
+        if is_sticker:
+            force_document = False
+            supports_streaming = None
+        elif is_video_document:
+            force_document = False
+            supports_streaming = getattr(video_attr, "supports_streaming", True) or True
+        else:
+            force_document = bool(original_name)
+            supports_streaming = None
+
+        is_photo = bool(getattr(msg, "photo", None)) and not getattr(msg, "document", None)
+        mime_type = ""
+        if getattr(msg, "document", None):
+            mime_type = msg.document.mime_type or ""
+        elif is_photo:
+            mime_type = "image/jpeg"
+
+        return {
+            "caption": text_override if use_override else (msg.message or ""),
+            "entities": None if use_override else (msg.entities or None),
+            "attributes": attributes,
+            "force_document": force_document,
+            "supports_streaming": supports_streaming,
+            "is_photo": is_photo,
+            "mime_type": mime_type,
+        }
+
     async def _send_copy_payload(self, msg, dest_id: int | str, payload: dict,
                                  dest_topic: Optional[int] = None,
                                  text_override: Optional[str] = None):
@@ -578,47 +668,15 @@ class TelegramDownloader:
 
         temp_path = payload.get("temp_path")
         try:
-            caption = text_override if use_override else (msg.message or "")
-            send_kwargs = {"caption": caption}
-            if msg.entities and not use_override:
-                send_kwargs["formatting_entities"] = msg.entities
-
-            # Build attributes while preserving the original filename AND any
-            # video metadata. If the file is a video (document with video MIME or
-            # DocumentAttributeVideo), do *not* force_document=True — otherwise
-            # Telegram renders it as a plain file download and the client shows
-            # no preview/player. For non-media documents keep force_document so
-            # the filename is honored.
-            #
-            # Stickers: copy the original DocumentAttributeSticker (and
-            # DocumentAttributeAnimated for animated stickers) back onto the
-            # upload so the destination renders it as a sticker rather than a
-            # raw .webp/.webm/.tgs file. Stickers never carry a filename, so
-            # we also keep force_document=False.
-            original_name = payload.get("original_name")
-            video_attr = payload.get("video_attr")
-            sticker_attr = payload.get("sticker_attr")
-            animated_attr = payload.get("animated_attr")
-            is_video_document = bool(payload.get("is_video_document"))
-            is_sticker = sticker_attr is not None
-            attributes = []
-            if original_name and not is_sticker:
-                attributes.append(DocumentAttributeFilename(original_name))
-            if video_attr and not is_sticker:
-                attributes.append(video_attr)
-            if is_sticker:
-                if animated_attr:
-                    attributes.append(animated_attr)
-                attributes.append(sticker_attr)
-            if attributes:
-                send_kwargs["attributes"] = attributes
-            if is_sticker:
-                send_kwargs["force_document"] = False
-            elif is_video_document:
-                send_kwargs["force_document"] = False
-                send_kwargs["supports_streaming"] = getattr(video_attr, "supports_streaming", True) or True
-            else:
-                send_kwargs["force_document"] = bool(original_name)
+            spec = self._copy_send_spec(msg, payload, text_override)
+            send_kwargs = {"caption": spec["caption"]}
+            if spec["entities"]:
+                send_kwargs["formatting_entities"] = spec["entities"]
+            if spec["attributes"]:
+                send_kwargs["attributes"] = spec["attributes"]
+            send_kwargs["force_document"] = spec["force_document"]
+            if spec["supports_streaming"] is not None:
+                send_kwargs["supports_streaming"] = spec["supports_streaming"]
             if reply_to:
                 send_kwargs["reply_to"] = reply_to
 
@@ -692,6 +750,160 @@ class TelegramDownloader:
             dest_topic=dest_topic, text_override=text_override,
         )
 
+    async def _send_copy_album(self, entries, dest_id: int | str,
+                               dest_topic: Optional[int] = None):
+        """Send several copy payloads as ONE media group (album).
+
+        ``entries``: ``[{"msg": Message, "payload": dict, "text_override": ...}]``
+        — every payload must be ``kind == "media"``.
+
+        Why this exists: the source channel posts albums as N messages sharing
+        a ``grouped_id``. Uploading them one by one produces N unrelated
+        messages on the destination (each with its own preview), which is what
+        made mirrored albums unreadable. Telegram only renders an album when
+        all members arrive in a single ``messages.sendMultiMedia`` call — the
+        server then assigns one shared ``grouped_id``.
+
+        Uploads go through ``messages.uploadMedia`` first (Telethon's own album
+        path does the same): ``InputMediaUploadedPhoto`` is rejected inside
+        sendMultiMedia, so we need the resulting Photo/Document reference. The
+        per-item attributes come from ``_copy_send_spec`` so videos keep their
+        player and documents keep their filenames.
+
+        Returns a list aligned with *entries*: the sent Message (or an id stub)
+        per entry, ``None`` where the server echoed no id. Temp files are NOT
+        deleted here — the caller owns cleanup so a failed album can still be
+        retried message-by-message.
+        """
+        import hashlib
+
+        entity = await self.client.get_input_entity(dest_id)
+        reply_to = dest_topic if (dest_topic and dest_topic > 1) else None
+
+        multi_media = []
+        random_ids = []
+        for entry in entries:
+            msg = entry["msg"]
+            payload = entry["payload"]
+            spec = self._copy_send_spec(msg, payload, entry.get("text_override"))
+            temp_path = payload.get("temp_path")
+            if not temp_path:
+                raise ValueError(f"album entry src#{getattr(msg, 'id', '?')} has no temp file")
+
+            uploaded = await asyncio.wait_for(
+                self.client.upload_file(temp_path),
+                timeout=self._transfer_timeout(payload.get("size") or 0),
+            )
+            if spec["is_photo"]:
+                uploaded_media = InputMediaUploadedPhoto(file=uploaded)
+            else:
+                uploaded_media = InputMediaUploadedDocument(
+                    file=uploaded,
+                    mime_type=spec["mime_type"] or "application/octet-stream",
+                    attributes=spec["attributes"] or [],
+                    force_file=bool(spec["force_document"]),
+                )
+            # uploadMedia stores the file and hands back the Photo/Document ref
+            # that sendMultiMedia accepts.
+            ref = await asyncio.wait_for(
+                self.client(UploadMediaRequest(peer=entity, media=uploaded_media)),
+                timeout=self._transfer_timeout(payload.get("size") or 0),
+            )
+            media_ref = getattr(ref, "photo", None) or getattr(ref, "document", None)
+            if media_ref is None:
+                raise ValueError(f"uploadMedia returned no media for src#{getattr(msg, 'id', '?')}")
+
+            # Stable across scheduler cycles as well as retries of this RPC:
+            # a lost response must not turn the next run into a duplicate post.
+            source_peer = tl_utils.get_peer_id(msg.peer_id)
+            dest_peer = tl_utils.get_peer_id(entity)
+            identity = f"copy-album-v1:{source_peer}:{msg.id}:{dest_peer}:{reply_to}"
+            rid = int.from_bytes(
+                hashlib.sha256(identity.encode()).digest()[:8], "big"
+            ) & ((1 << 63) - 1)
+            random_ids.append(rid)
+            multi_media.append(InputSingleMedia(
+                media=tl_utils.get_input_media(media_ref),
+                random_id=rid,
+                message=spec["caption"],
+                entities=spec["entities"],
+            ))
+
+        request = SendMultiMediaRequest(
+            peer=entity,
+            multi_media=multi_media,
+            reply_to=None if reply_to is None else InputReplyToMessage(reply_to),
+        )
+        # Retrying sendMultiMedia is idempotent: the same random_ids make
+        # Telegram return the already-created messages instead of duplicating.
+        last_err: Optional[BaseException] = None
+        # Bytes are already uploaded, so the request itself is a quick RPC —
+        # a generous fixed cap just keeps a stalled connection from hanging
+        # the whole copy pipeline.
+        send_timeout = max(120.0, min(600.0, 30.0 * len(entries)))
+        for attempt in range(3):
+            try:
+                result = await asyncio.wait_for(self.client(request), timeout=send_timeout)
+                return self._align_sent(random_ids, result)
+            except FloodWaitError as fw:
+                last_err = fw
+                print(f"\n  ⏳ Album flood wait {fw.seconds}s (attempt {attempt + 1}/3)...")
+                await asyncio.sleep(fw.seconds + 1)
+            except Exception as e:
+                last_err = e
+                if is_transient_error(e) and attempt < 2:
+                    print(
+                        f"\n  ⏳ Album transient {type(e).__name__}: {e} "
+                        f"(attempt {attempt + 1}/3)"
+                    )
+                    await sleep_backoff(attempt, base=2.0, cap=60.0)
+                    continue
+                raise
+        if last_err is not None:
+            raise last_err
+        return [None] * len(entries)
+
+    def _align_sent(self, random_ids, result) -> list:
+        """Map a multi-message Updates response back onto *random_ids*.
+
+        Alignment strategy (in order):
+          1. random_id → UpdateNew* message / UpdateMessageID
+          2. single leftover UpdateNew* only when exactly one None slot remains
+             (never multi-slot order-fill — that can cross-map src→dest when
+             channel echoes omit random_id and order diverges)
+        """
+        rid_to_msg: dict[int, object] = {}
+        rid_to_dest_id: dict[int, int] = {}
+        ordered_new: list = []  # UpdateNew* messages in arrival order
+        for upd in getattr(result, "updates", []) or []:
+            if isinstance(upd, (UpdateNewChannelMessage, UpdateNewMessage)):
+                msg = upd.message
+                ordered_new.append(msg)
+                rid = getattr(msg, "random_id", None) or getattr(upd, "random_id", None)
+                if rid is not None:
+                    rid_to_msg[rid] = msg
+            elif isinstance(upd, UpdateMessageID):
+                rid_to_dest_id[upd.random_id] = upd.id
+
+        out: list = []
+        used_msgs: set[int] = set()  # id() of message objects already claimed
+        for rid in random_ids:
+            if rid in rid_to_msg:
+                msg = rid_to_msg[rid]
+                out.append(msg)
+                used_msgs.add(id(msg))
+            elif rid in rid_to_dest_id:
+                out.append(_IdStub(rid_to_dest_id[rid]))
+            else:
+                out.append(None)
+
+        none_idxs = [i for i, x in enumerate(out) if x is None]
+        if len(none_idxs) == 1:
+            leftover = [m for m in ordered_new if id(m) not in used_msgs]
+            if len(leftover) == 1:
+                out[none_idxs[0]] = leftover[0]
+        return out
+
     async def forward_batch(self, source, dest, msgs, *, drop_author: bool = True,
                             top_msg_id: int | None = None):
         """Native server-side forward via raw ForwardMessagesRequest.
@@ -711,7 +923,6 @@ class TelegramDownloader:
              channel echoes omit random_id and order diverges)
         """
         import random
-        from telethon.tl.types import UpdateMessageID
         from_peer = await self.client.get_input_entity(source)
         to_peer = await self.client.get_input_entity(dest)
         ids = [int(m) if isinstance(m, int) else int(m.id) for m in msgs]
@@ -726,48 +937,7 @@ class TelegramDownloader:
         if top_msg_id and top_msg_id > 1:
             kwargs["top_msg_id"] = top_msg_id
         result = await self.client(ForwardMessagesRequest(**kwargs))
-
-        rid_to_msg: dict[int, object] = {}
-        rid_to_dest_id: dict[int, int] = {}
-        ordered_new: list = []  # UpdateNew* messages in arrival order
-        for upd in getattr(result, "updates", []) or []:
-            if isinstance(upd, (UpdateNewChannelMessage, UpdateNewMessage)):
-                msg = upd.message
-                ordered_new.append(msg)
-                rid = getattr(msg, "random_id", None) or getattr(upd, "random_id", None)
-                if rid is not None:
-                    rid_to_msg[rid] = msg
-            elif isinstance(upd, UpdateMessageID):
-                rid_to_dest_id[upd.random_id] = upd.id
-
-        class _Stub:
-            __slots__ = ("id",)
-
-            def __init__(self, mid: int):
-                self.id = mid
-
-        out: list = []
-        used_msgs: set[int] = set()  # id() of message objects already claimed
-        for rid in random_ids:
-            if rid in rid_to_msg:
-                msg = rid_to_msg[rid]
-                out.append(msg)
-                used_msgs.add(id(msg))
-            elif rid in rid_to_dest_id:
-                out.append(_Stub(rid_to_dest_id[rid]))
-            else:
-                out.append(None)
-
-        # Safe single-slot fallback only. Multi-None order-fill can attach the
-        # wrong dest id when random_id is missing and Updates order diverges
-        # from input order — better leave None (retry/gap) than corrupt map.
-        none_idxs = [i for i, x in enumerate(out) if x is None]
-        if len(none_idxs) == 1:
-            leftover = [m for m in ordered_new if id(m) not in used_msgs]
-            if len(leftover) == 1:
-                out[none_idxs[0]] = leftover[0]
-
-        return out
+        return self._align_sent(random_ids, result)
 
     # ─── Forward topic ────────────────────────────────────────────
 
